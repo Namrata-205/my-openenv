@@ -1,108 +1,171 @@
-name: monsoon-floodgate-control
+openenv_version: "1.0"
+
+name: atc-tracon-rl
 version: "1.0.0"
 description: >
-  Multi-agent stormwater gate and pump control for Mumbai flood prevention.
-  Simulates real-time management of 3 interconnected sub-basins during
-  erratic monsoon events (inspired by Dharavi flood-risk zones).
-  Agents receive partial observability of neighbouring basins and must
-  coordinate gate/pump settings to minimise flooding while conserving energy.
+  Reinforcement Learning environment for Air Traffic Control decision support
+  in TRACON (Terminal Radar Approach Control) scenarios. Provides minimal,
+  interpretable advisory actions to assist human controllers.
 
-author: "Monsoon Flood Gate Control Team"
+author: "ATC RL Team"
 license: MIT
-tags:
-  - openenv
-  - real-world
-  - multi-agent
-  - partial-observability
-  - stormwater
-  - climate
-  - india
 
 tasks:
-  - id: task_easy
-    name: "Single-Peak Monsoon Response"
-    difficulty: easy
+  - id: wake_turbulence
+    name: Wake Turbulence Separation
     description: >
-      A single smooth monsoon burst over 6 hours. Predictable forecast,
-      linear rainfall ramp. Agent must proactively drain basin before peak.
-    reward_range: [-2.5, 0.65]
-    max_steps: 72
-    grader: deterministic
+      Maintain safe wake-turbulence spacing between sequenced aircraft
+      by issuing heading or speed adjustments.
+    observation_space:
+      type: structured
+      fields:
+        - name: aircraft
+          type: array[AircraftState]
+        - name: separation_matrix
+          type: dict[string, float]
+    action_space:
+      type: structured
+      allowed_actions:
+        - heading_change
+        - speed_change
+        - sequence_swap
+    reward:
+      type: continuous
+      range: [0.0, 1.0]
+      description: >
+        Mean ratio of actual vs required separation across all consecutive pairs.
 
-  - id: task_medium
-    name: "Double-Burst Storm Coordination"
-    difficulty: medium
+  - id: go_around_prevention
+    name: Go-Around Prevention via Sequencing
     description: >
-      Two storm bursts separated by a lull. Agents must drain during lull
-      to create buffer capacity. Forecast has ±30% noise. Requires
-      inter-basin coordination signal reading.
-    reward_range: [-2.5, 0.65]
-    max_steps: 72
-    grader: deterministic
+      Optimise landing order so faster aircraft lead slower ones,
+      preventing go-arounds and fuel emergencies.
+    observation_space:
+      type: structured
+      fields:
+        - name: aircraft
+          type: array[AircraftState]
+    action_space:
+      type: structured
+      allowed_actions:
+        - sequence_swap
+        - speed_change
+    reward:
+      type: continuous
+      range: [0.0, 1.0]
+      description: >
+        Fraction of correctly ordered pairs with a fuel-state bonus.
 
-  - id: task_hard
-    name: "Erratic Extreme Event (Dharavi Worst-Case)"
-    difficulty: hard
+  - id: emergency_vectoring
+    name: Emergency Vectoring
     description: >
-      Simulates an extreme Mumbai rainfall event: sudden spikes up to
-      200mm/hr, unpredictable drops, rising downstream river level.
-      Partial observability of neighbours is most limiting here.
-    reward_range: [-2.5, 0.65]
-    max_steps: 72
-    grader: deterministic
+      Vector a MAYDAY aircraft to the runway as quickly as possible,
+      clearing traffic and aligning the aircraft correctly.
+    observation_space:
+      type: structured
+      fields:
+        - name: aircraft
+          type: array[AircraftState]
+        - name: runways
+          type: array[RunwayState]
+    action_space:
+      type: structured
+      allowed_actions:
+        - vector
+        - heading_change
+        - sequence_swap
+    reward:
+      type: continuous
+      range: [0.0, 1.0]
+      description: >
+        Weighted combination of runway proximity, heading alignment,
+        and fuel urgency for the emergency aircraft.
 
-observation_space:
-  type: object
-  fields:
-    basin_id: {type: int, description: "Which sub-basin (0–2)"}
-    water_level_m: {type: float, range: [0, 2.2], description: "Current water depth in metres"}
-    water_level_fraction: {type: float, range: [0.0, 1.1], description: "water_level / capacity"}
-    rainfall_mm_per_hr: {type: float, range: [0, 250], description: "Live rain gauge reading"}
-    river_level_m: {type: float, range: [0.3, 3.5], description: "Downstream river level"}
-    gate_positions: {type: array, items: float, length: 3, range: [0.0, 1.0]}
-    pump_speeds: {type: array, items: float, length: 2, range: [0.0, 1.0]}
-    is_flooding: {type: bool}
-    neighbors: {type: array, description: "Partial, noisy view of other basins"}
-    timestep: {type: int, range: [0, 72]}
-    elapsed_minutes: {type: float, range: [0, 360]}
-    storm_phase: {type: str, enum: [pre_monsoon, peak, recession, clear]}
-    rainfall_forecast: {type: array, items: float, length: 3, description: "Noisy 3-step forecast"}
+  - id: conflict_resolution
+    name: Conflict Alert Resolution
+    description: >
+      Resolve lateral and vertical conflicts between aircraft using
+      the fewest and smallest corrective actions.
+    observation_space:
+      type: structured
+      fields:
+        - name: aircraft
+          type: array[AircraftState]
+        - name: active_conflicts
+          type: array[ConflictInfo]
+    action_space:
+      type: structured
+      allowed_actions:
+        - heading_change
+        - altitude_change
+        - speed_change
+    reward:
+      type: continuous
+      range: [0.0, 1.0]
+      description: >
+        1 - (active_conflicts / number_of_aircraft).
 
-action_space:
-  type: object
-  fields:
-    gate_positions: {type: array, items: float, length: 3, range: [0.0, 1.0]}
-    pump_speeds: {type: array, items: float, length: 2, range: [0.0, 1.0]}
+  - id: gate_assignment
+    name: Gate / Stand Assignment
+    description: >
+      Assign landed aircraft to compatible, unoccupied gates efficiently.
+    observation_space:
+      type: structured
+      fields:
+        - name: aircraft
+          type: array[AircraftState]
+        - name: gates
+          type: array[GateState]
+    action_space:
+      type: structured
+      allowed_actions:
+        - assign_gate
+    reward:
+      type: continuous
+      range: [0.0, 1.0]
+      description: >
+        Weighted combination of assignment rate and gate compatibility.
 
-reward:
-  type: shaped
-  components:
-    flood_penalty: "Negative reward when water exceeds capacity (−2.0 when flooding)"
-    drainage_bonus: "Positive reward for net outflow exceeding inflow"
-    energy_cost: "Negative reward proportional to pump energy used"
-    gate_chatter_penalty: "Negative reward for rapid gate oscillation"
-    forecast_bonus: "Positive reward for proactive draining before forecast peaks"
-  range: [-2.5, 0.65]
-  partial_progress: true
+api:
+  endpoints:
+    reset:
+      method: POST
+      path: /reset
+      request_schema: ResetRequest
+      response_schema: EnvironmentState
+    step:
+      method: POST
+      path: /step
+      request_schema: StepRequest
+      response_schema: StepResult
+    state:
+      method: GET
+      path: /state
+      response_schema: EnvironmentState
+    health:
+      method: GET
+      path: /health
+      response_schema: HealthResponse
 
-endpoints:
-  reset: {method: POST, path: /reset}
-  step: {method: POST, path: /step}
-  state: {method: GET, path: /state}
-  health: {method: GET, path: /health}
-  tasks: {method: GET, path: /tasks}
-  grade: {method: GET, path: /grade}
-  info: {method: GET, path: /info}
+environment:
+  observation_type: structured_json
+  action_type: structured_json
+  reward_range: [0.0, 1.0]
+  max_steps: 30
+  deterministic: false
 
-docker:
-  base_image: python:3.11-slim
-  port: 8000
-  health_check: /health
+models:
+  typed: true
+  library: pydantic
+  schema_file: models.py
 
-huggingface:
-  space_sdk: docker
-  tags:
-    - openenv
-    - reinforcement-learning
-    - climate
-    - multi-agent
+inference:
+  script: inference.py
+  required_env_vars:
+    - API_BASE_URL
+    - MODEL_NAME
+    - HF_TOKEN
+  log_format:
+    start_token: "[START]"
+    step_token: "[STEP]"
+    end_token: "[END]"
