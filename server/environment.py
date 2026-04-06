@@ -1,8 +1,25 @@
 """
 environment.py — ATC TRACON RL Environment.
 
-Delegates all reward/penalty logic to graders.py (the canonical simulation module).
-Wraps each of the 5 grader classes behind the OpenEnv reset() / step() / state() API.
+Performance fixes in this revision (on top of previous bug-fix pass):
+  - _step_emergency: terminal condition now also checks env.inserted flag so
+    done=True fires the moment the grader confirms a clean insertion, even if
+    the conflict_count / insert_time path disagreed on a boundary step.
+  - _build_conflict: uses keyword-arg construction for ConflictAircraftState
+    to match the extended dataclass field order.
+  - reset(): mutable default `options={}` replaced with `options=None`.
+  - _aircraft_from_wake(): reads leading_speed / trailing_speed directly
+    from dataclass fields (no more getattr fallback).
+
+Retained from previous revision:
+  - Task 1: normalization range widened to handle bonus cap correctly
+  - Task 2: terminal condition uses all-landed/all-gone-around
+  - Task 3: terminal fires on successful insertion
+  - Task 4: action translator maps full set including ac2 and altitude actions
+  - Task 5: multi-plane queue; terminal only when queue exhausted
+  - Task 5: gate pool randomized at reset so agent learns a policy
+  - reward vs score split: reward = shaped step signal, score = clean episodic metric
+  - conflict detection respects vertical separation (1000 ft threshold)
 """
 
 from __future__ import annotations
@@ -11,17 +28,11 @@ import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
-# ── Import everything from graders.py ───────────────────────────────────────
 from graders import (
-    # Task 1
     AircraftCategory, WakeTurbulenceEnv, REQUIRED_SEPARATION,
-    # Task 2
     InboundFlight, sequence_flights,
-    # Task 3
     Aircraft, EmergencyVectorEnv,
-    # Task 4
     ConflictAircraftState, ConflictAlertEnv,
-    # Task 5
     Gate, ArrivingPlane, GateAssignmentEnv,
 )
 
@@ -44,16 +55,15 @@ class ATCEnvironment:
         self._done: bool                   = False
         self._rng: random.Random           = random.Random()
         self._episode_rewards: List[float] = []
+        self._episode_scores:  List[float] = []
         self._info: Dict[str, Any]         = {}
 
-        # Task-specific live objects (from graders.py)
         self._wake_env:     Optional[WakeTurbulenceEnv]  = None
         self._flights:      List[InboundFlight]          = []
         self._emerg_env:    Optional[EmergencyVectorEnv] = None
         self._conflict_env: Optional[ConflictAlertEnv]  = None
         self._gate_env:     Optional[GateAssignmentEnv] = None
 
-        # Pydantic model snapshots for state()
         self._aircraft:  List[AircraftState] = []
         self._gates_raw: List[GateState]     = []
         self._runways:   List[RunwayState]   = []
@@ -62,20 +72,28 @@ class ATCEnvironment:
     # OpenEnv API
     # ─────────────────────────────────────────
 
-    def reset(self, task: Optional[TaskType] = None,
-              seed: Optional[int] = None,
-              options: Dict[str, Any] = {}) -> EnvironmentState:
+    def reset(
+        self,
+        task: Optional[TaskType] = None,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,   # FIX: was `= {}` (mutable default)
+    ) -> EnvironmentState:
+        options = options or {}
+
         self._rng = random.Random(seed)
         random.seed(seed)
+
         self._step            = 0
         self._done            = False
         self._info            = {}
         self._episode_rewards = []
+        self._episode_scores  = []
+
         if isinstance(task, str):
             task = TaskType(task)
-        self._task = task or self._rng.choice(list(TaskType))
-        self._max_steps       = options.get("max_steps", self.MAX_STEPS_DEF)
-        self._runways         = self._default_runways()
+        self._task      = task or self._rng.choice(list(TaskType))
+        self._max_steps = options.get("max_steps", self.MAX_STEPS_DEF)
+        self._runways   = self._default_runways()
 
         {
             TaskType.WAKE_TURBULENCE:      self._build_wake,
@@ -100,10 +118,13 @@ class ATCEnvironment:
         }[self._task](actions)
 
         self._episode_rewards.append(reward)
+        self._episode_scores.append(score)
         info["episode_avg_reward"] = round(
             sum(self._episode_rewards) / len(self._episode_rewards), 4)
+        info["episode_avg_score"] = round(
+            sum(self._episode_scores) / len(self._episode_scores), 4)
 
-        done = self._step >= self._max_steps or info.get("terminal", False)
+        done       = self._step >= self._max_steps or info.get("terminal", False)
         self._done = done
         self._info = info
 
@@ -128,15 +149,16 @@ class ATCEnvironment:
                 RunwayState(runway_id="28R", active=True)]
 
     def _build_wake(self):
-        # Only use pairs that exist in graders.py REQUIRED_SEPARATION dict
         valid_pairs = list(REQUIRED_SEPARATION.keys())
         lead_cat, trail_cat = self._rng.choice(valid_pairs)
-        init_sep = self._rng.uniform(3.5, 6.5)
+        req_sep  = REQUIRED_SEPARATION[(lead_cat, trail_cat)]
+        init_sep = req_sep + self._rng.uniform(0.0, 2.0)
         self._wake_env  = WakeTurbulenceEnv(leading_cat=lead_cat,
                                             trailing_cat=trail_cat,
                                             current_sep=init_sep)
-        self._aircraft  = self._aircraft_from_wake(self._wake_env)
-        self._gates_raw = []
+        self._aircraft       = self._aircraft_from_wake(self._wake_env)
+        self._gates_raw      = []
+        self._wake_good_steps = 0
 
     def _build_go_around(self):
         callsigns = ["UAL101", "DAL202", "AAL303", "SWA404", "FDX505"]
@@ -163,24 +185,33 @@ class ATCEnvironment:
                      self._rng.uniform(0, 8))
             for i in range(3)
         ]
-        emerg = Aircraft("EMER1", 0, 5000, 180, 15.0, 0.0)
+        fuel  = round(self._rng.uniform(0.05, 0.4), 2)
+        emerg = Aircraft("EMER1", 0, 5000, 180, 15.0, 0.0, fuel_state=fuel)
         self._emerg_env = EmergencyVectorEnv(emergency=emerg, traffic=traffic)
         self._aircraft  = self._aircraft_from_emergency(self._emerg_env)
         self._gates_raw = []
 
     def _build_conflict(self):
+        # Spawn AC1 at origin heading east; AC2 starts at least 6 NM away heading west
+        # so step 1 never starts with a proximity violation.
         ac1 = ConflictAircraftState(
-            "AC1", 0.0, 0.0,
-            self._rng.uniform(60, 120),
-            self._rng.uniform(220, 280),
+            callsign="AC1",
+            x=0.0,
+            y=0.0,
+            altitude=self._rng.uniform(6000, 12000),
+            speed_kts=self._rng.uniform(220, 280),
+            heading_deg=self._rng.uniform(60, 120),
             target_hdg=90.0,
         )
+        # Ensure x-separation is at least 6 NM to avoid instant violation
+        ac2_x = self._rng.uniform(6.5, 10.0)
         ac2 = ConflictAircraftState(
-            "AC2",
-            self._rng.uniform(4, 8),
-            self._rng.uniform(-2, 2),
-            self._rng.uniform(240, 300),
-            self._rng.uniform(220, 280),
+            callsign="AC2",
+            x=ac2_x,
+            y=self._rng.uniform(-1, 1),
+            altitude=self._rng.uniform(6000, 12000),
+            speed_kts=self._rng.uniform(220, 280),
+            heading_deg=self._rng.uniform(240, 300),
             target_hdg=270.0,
         )
         self._conflict_env = ConflictAlertEnv(ac1=ac1, ac2=ac2)
@@ -188,17 +219,35 @@ class ATCEnvironment:
         self._gates_raw    = []
 
     def _build_gate(self):
-        gate_pool = [
-            Gate("A1", occupied=False, taxi_dist_min=4.0,  compatible=True,  blocked_by=None),
-            Gate("A2", occupied=True,  taxi_dist_min=3.5,  compatible=True,  blocked_by=None),
-            Gate("B1", occupied=False, taxi_dist_min=12.0, compatible=True,  blocked_by=None),
-            Gate("B2", occupied=False, taxi_dist_min=6.0,  compatible=False, blocked_by=None),
-            Gate("C1", occupied=False, taxi_dist_min=5.5,  compatible=True,  blocked_by="DAL440"),
-            Gate("C2", occupied=False, taxi_dist_min=7.5,  compatible=True,  blocked_by=None),
+        gate_templates = [
+            ("A1", 4.0,  True),
+            ("A2", 3.5,  True),
+            ("B1", 12.0, True),
+            ("B2", 6.0,  False),
+            ("C1", 5.5,  True),
+            ("C2", 7.5,  True),
         ]
-        arriving = ArrivingPlane("UAL101",
-                                 eta_min=round(self._rng.uniform(5, 18), 1))
-        self._gate_env  = GateAssignmentEnv(arriving=arriving, gates=gate_pool)
+        gate_pool = []
+        for gate_id, taxi, compatible in gate_templates:
+            occupied   = self._rng.random() < 0.3
+            blocked_by = self._rng.choice([None, None, "BLOCKER"]) if not occupied else None
+            gate_pool.append(
+                Gate(gate_id=gate_id, occupied=occupied, taxi_dist_min=taxi,
+                     compatible=compatible, blocked_by=blocked_by)
+            )
+
+        n_planes  = self._rng.randint(3, 5)
+        callsigns = ["UAL101", "SWA202", "AAL303", "DAL404", "FDX505"]
+        planes    = [
+            ArrivingPlane(callsigns[i], eta_min=round(self._rng.uniform(5, 20), 1))
+            for i in range(n_planes)
+        ]
+
+        self._gate_env  = GateAssignmentEnv(
+            arriving=planes[0],
+            gates=gate_pool,
+            queue=planes[1:],
+        )
         self._aircraft  = []
         self._gates_raw = self._gates_from_env(self._gate_env)
 
@@ -208,23 +257,53 @@ class ATCEnvironment:
 
     def _step_wake(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
         action_str = self._action_to_wake_str(actions)
-        raw_reward, desc = self._wake_env.step(action_str)
-        norm = self._normalise(raw_reward, low=-35, high=20)
+
+        if action_str == "slow_down_trailing":
+            self._wake_env.trailing_speed = max(
+                120, self._wake_env.trailing_speed - 10)
+        elif action_str == "speed_up_trailing":
+            self._wake_env.trailing_speed = min(
+                200, self._wake_env.trailing_speed + 10)
+
+        sep_before          = self._wake_env.current_sep
+        raw_reward, log_str = self._wake_env.step(action_str)
+        delta_sep           = self._wake_env.current_sep - sep_before
+
+        violated    = self._wake_env.violated
+        reward_norm = self._normalise(raw_reward, low=-55, high=25)
+
         self._aircraft = self._aircraft_from_wake(self._wake_env)
-        violations = ["LOSS OF SEPARATION"] if self._wake_env.violated else []
+        violations     = ["LOSS OF SEPARATION"] if violated else []
+
+        sep_ratio  = self._wake_env.current_sep / self._wake_env.required_sep
+        max_buffer = 2.0
+        buffer     = max(0.0, min(sep_ratio - 1.0, max_buffer))
+        score      = ((0.7 + 0.3 * (buffer / max_buffer))
+                      if not violated
+                      else max(0.0, sep_ratio * 0.7))
+
+        # Terminal: achieved good separation (≥ required + 0.5 NM) for 3 steps
+        # without violation, OR exceeded max delay (episode is unrecoverable)
+        sep_ratio   = self._wake_env.current_sep / self._wake_env.required_sep
+        good_sep    = (not violated) and (sep_ratio >= 1.1)
+        self._wake_good_steps = getattr(self, "_wake_good_steps", 0)
+        self._wake_good_steps = self._wake_good_steps + 1 if good_sep else 0
+        terminal = self._wake_good_steps >= 3 or self._wake_env.delay_sec > 80
+
         info = {
             "raw_reward":  raw_reward,
-            "description": desc,
+            "log":         log_str,
             "sep_nm":      round(self._wake_env.current_sep, 2),
             "required_nm": self._wake_env.required_sep,
-            "violated":    self._wake_env.violated,
+            "delta_sep":   round(delta_sep, 3),
+            "violated":    violated,
             "action":      action_str,
-            "terminal":    self._wake_env.violated,
+            "terminal":    terminal,
         }
-        return norm, norm, violations, info
+        return reward_norm, round(score, 4), violations, info
 
     def _step_go_around(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
-        strategy = self._action_to_strategy(actions)
+        strategy     = self._action_to_strategy(actions)
         flights_copy = [
             InboundFlight(f.callsign, f.eta_min, f.fuel_lbs, f.priority)
             for f in self._flights
@@ -234,68 +313,119 @@ class ATCEnvironment:
             orig.landed      = copy.landed
             orig.went_around = copy.went_around
             orig.holding_min = copy.holding_min
+
         n    = len(self._flights)
         norm = self._normalise(raw_reward, low=-28 * n, high=12 + 3 * n)
         self._aircraft = self._aircraft_from_flights(self._flights)
-        go_arounds = [f.callsign for f in self._flights if f.went_around]
-        violations = [f"GO-AROUND: {cs}" for cs in go_arounds]
+        go_arounds     = [f.callsign for f in self._flights if f.went_around]
+        violations     = [f"GO-AROUND: {cs}" for cs in go_arounds]
+
+        landed_count = stats["landed"]
+        score        = round(landed_count / max(1, n), 4)
+
+        all_resolved = all(f.landed or f.went_around for f in self._flights)
         info = {
             "raw_reward": raw_reward,
             "strategy":   strategy,
             "events":     events,
             "stats":      stats,
-            "terminal":   stats["go_arounds"] == n,
+            "terminal":   all_resolved,
         }
-        return norm, norm, violations, info
+        return norm, score, violations, info
 
     def _step_emergency(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
         heading, altitude, insert_time = self._action_to_vector(actions)
         raw_reward, log = self._emerg_env.insert_emergency(heading, altitude, insert_time)
-        n_traffic = len(self._emerg_env.traffic)
-        norm = self._normalise(raw_reward, low=-22 * n_traffic - 12, high=22)
+
+        n_traffic   = len(self._emerg_env.traffic)
+        max_urgency = 2.0
+        worst_raw   = -22 * max_urgency * n_traffic - 12
+        best_raw    = 18 * max_urgency + 4
+        norm        = self._normalise(raw_reward, low=worst_raw, high=best_raw)
+
         self._aircraft = self._aircraft_from_emergency(self._emerg_env)
-        violations = [l for l in log if "SAFETY VIOLATION" in l]
+        violations     = [l for l in log if "SAFETY VIOLATION" in l]
+
+        conflict_count = len(violations)
+        time_penalty   = max(0, insert_time - 2) * 0.1
+        score          = max(0.0, 1.0 - conflict_count * 0.33 - time_penalty)
+
+        # Terminal: grader confirmed insertion, OR conflict-free within time window,
+        # OR too many conflicts (unrecoverable). Always terminates after insertion.
+        terminal = (
+            self._emerg_env.inserted
+            or (conflict_count == 0 and insert_time <= 2.0)
+            or conflict_count >= n_traffic
+        )
+
         info = {
             "raw_reward":  raw_reward,
             "log":         log,
             "heading":     heading,
             "altitude":    altitude,
             "insert_time": insert_time,
-            "terminal":    raw_reward >= 18,
+            "terminal":    terminal,
         }
-        return norm, norm, violations, info
+        return norm, round(score, 4), violations, info
 
     def _step_conflict(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
-        action_str = self._action_to_conflict_str(actions)
-        raw_reward, desc = self._conflict_env.step(action_str)
-        norm = self._normalise(raw_reward, low=-20, high=20)
-        self._aircraft = self._aircraft_from_conflict(self._conflict_env)
-        sep = self._conflict_env._separation()
-        violations = [f"CRITICAL PROXIMITY: {sep:.2f} NM"] if sep < 5.0 else []
+        action_str                       = self._action_to_conflict_str(actions)
+        raw_reward, desc, sep, vert_sep  = self._conflict_env.step(action_str)
+        norm                             = self._normalise(raw_reward, low=-25, high=25)
+        self._aircraft                   = self._aircraft_from_conflict(self._conflict_env)
+
+        # sep and vert_sep are PRE-tick (current positions when action was applied)
+        violations = ([f"CRITICAL PROXIMITY: {sep:.2f} NM"]
+                      if sep < 5.0 and vert_sep < 1000 else [])
+
+        score = min(1.0, sep / 8.0)
+
         info = {
             "raw_reward":  raw_reward,
             "description": desc,
             "separation":  round(sep, 2),
+            "vert_sep_ft": round(vert_sep, 0),
             "action":      action_str,
-            "terminal":    sep < 3.0,
+            "terminal":    sep < 3.0 and vert_sep < 1000,
         }
-        return norm, norm, violations, info
+        return norm, round(score, 4), violations, info
 
     def _step_gate(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
         gate_id = self._action_to_gate_id(actions)
-        if gate_id is None:
+
+        # Safety override: if the agent requested a specific gate, validate it.
+        # If the requested gate is occupied or blocked, fall back to find_best_gate()
+        # so the environment never blindly assigns to an unusable gate.
+        if gate_id is not None:
+            requested_gate = next(
+                (g for g in self._gate_env.gates if g.gate_id == gate_id), None)
+            if requested_gate is None or requested_gate.occupied or requested_gate.blocked:
+                gate_id = self._gate_env.find_best_gate()
+        else:
             gate_id = self._gate_env.find_best_gate()
+
         raw_reward, log = self._gate_env.assign(gate_id)
-        norm = self._normalise(raw_reward, low=-60, high=20)
+        norm            = self._normalise(raw_reward, low=-60, high=20)
         self._gates_raw = self._gates_from_env(self._gate_env)
-        violations = [l.strip() for l in log if "!!!" in l]
+        violations      = [l.strip() for l in log if "!!!" in l]
+
+        last  = self._gate_env.assignments[-1] if self._gate_env.assignments else {}
+        # Score: 1.0 for perfect (valid + compatible), 0.5 for valid but incompatible, 0.0 for occupied/blocked
+        gate_obj = next((g for g in self._gate_env.gates if g.gate_id == gate_id), None)
+        if last.get("valid"):
+            score = 1.0 if (gate_obj and gate_obj.compatible) else 0.5
+        else:
+            score = 0.0
+
+        queue_done = self._gate_env.queue_empty
         info = {
             "raw_reward":    raw_reward,
             "log":           log,
             "gate_assigned": gate_id,
-            "terminal":      self._gate_env.assigned_gate is not None,
+            "assignments":   self._gate_env.assignments,
+            "terminal":      queue_done,
         }
-        return norm, norm, violations, info
+        return norm, round(score, 4), violations, info
 
     # ─────────────────────────────────────────
     # Action translators
@@ -305,19 +435,18 @@ class ATCEnvironment:
         for a in actions:
             if a.action_type == ActionType.SPEED_CHANGE and a.value is not None:
                 return "slow_down_trailing" if a.value < 0 else "speed_up_trailing"
+        for a in actions:
             if a.action_type == ActionType.HEADING_CHANGE:
                 return "increase_heading_gap"
-            if a.action_type == ActionType.NO_ACTION:
-                return "hold"
         return "hold"
 
     def _action_to_strategy(self, actions: List[ATCAction]) -> str:
         for a in actions:
             if a.action_type == ActionType.SEQUENCE_SWAP:
                 hint = (a.rationale or "").lower()
-                if "fuel" in hint: return "fuel_priority"
-                if "eta"  in hint: return "eta_optimized"
-                if "fcfs" in hint: return "fcfs"
+                if "fuel"  in hint: return "fuel_priority"
+                if "eta"   in hint: return "eta_optimized"
+                if "fcfs"  in hint: return "fcfs"
                 return "rl_agent"
         return "rl_agent"
 
@@ -335,10 +464,22 @@ class ATCEnvironment:
 
     def _action_to_conflict_str(self, actions: List[ATCAction]) -> str:
         for a in actions:
+            callsign = (a.target_callsign or "").upper()
+            is_ac2   = callsign == "AC2"
+
+            if a.action_type == ActionType.ALTITUDE_CHANGE and a.value is not None:
+                return "altitude_up" if a.value > 0 else "altitude_down"
+
             if a.action_type == ActionType.HEADING_CHANGE and a.value is not None:
+                if is_ac2:
+                    return "ac2_left_10" if a.value < 0 else "ac2_right_10"
                 return "left_10" if a.value < 0 else "right_10"
+
             if a.action_type == ActionType.SPEED_CHANGE and a.value is not None:
+                if is_ac2:
+                    return "ac2_slow_10" if a.value < 0 else "ac2_speed_10"
                 return "slow_10" if a.value < 0 else "speed_10"
+
         return "right_10"
 
     def _action_to_gate_id(self, actions: List[ATCAction]) -> Optional[str]:
@@ -361,11 +502,11 @@ class ATCEnvironment:
             AircraftState(callsign="LEAD",  category=_map[env.leading_cat],
                           status=AircraftStatus.APPROACH,
                           x=0.0, y=env.current_sep, altitude=3000,
-                          heading=180, speed=160),
+                          heading=180, speed=env.leading_speed),
             AircraftState(callsign="TRAIL", category=_map[env.trailing_cat],
                           status=AircraftStatus.APPROACH,
                           x=0.0, y=0.0, altitude=3000,
-                          heading=180, speed=150),
+                          heading=180, speed=env.trailing_speed),
         ]
 
     def _aircraft_from_flights(self, flights: List[InboundFlight]) -> List[AircraftState]:
@@ -386,6 +527,7 @@ class ATCEnvironment:
         ]
 
     def _aircraft_from_emergency(self, env: EmergencyVectorEnv) -> List[AircraftState]:
+        fuel    = env.emergency.fuel_state
         ac_list = [
             AircraftState(
                 callsign=env.emergency.callsign,
@@ -395,7 +537,7 @@ class ATCEnvironment:
                 altitude=env.emergency.altitude,
                 heading=env.emergency.heading,
                 speed=env.emergency.speed,
-                is_emergency=True, fuel_state=0.1,
+                is_emergency=True, fuel_state=fuel,
             ),
         ]
         for ac in env.traffic:
@@ -413,14 +555,14 @@ class ATCEnvironment:
                 callsign=env.ac1.callsign, category=ModelAircraftCategory.LARGE,
                 status=AircraftStatus.ENROUTE,
                 x=env.ac1.x, y=env.ac1.y,
-                altitude=5000, heading=env.ac1.heading_deg,
+                altitude=env.ac1.altitude, heading=env.ac1.heading_deg,
                 speed=env.ac1.speed_kts,
             ),
             AircraftState(
                 callsign=env.ac2.callsign, category=ModelAircraftCategory.LARGE,
                 status=AircraftStatus.ENROUTE,
                 x=env.ac2.x, y=env.ac2.y,
-                altitude=5000, heading=env.ac2.heading_deg,
+                altitude=env.ac2.altitude, heading=env.ac2.heading_deg,
                 speed=env.ac2.speed_kts,
             ),
         ]
@@ -443,7 +585,6 @@ class ATCEnvironment:
 
     @staticmethod
     def _normalise(value: float, low: float, high: float) -> float:
-        """Linearly scale raw grader reward into [0.0, 1.0]."""
         if high == low:
             return 0.5
         return max(0.0, min(1.0, (value - low) / (high - low)))
@@ -462,17 +603,21 @@ class ATCEnvironment:
         )
 
     def _detect_conflicts(self) -> List[Dict]:
+        """
+        Report conflicts only when BOTH lateral < 3 NM AND vertical < 1000 ft.
+        """
         conflicts = []
         acs = self._aircraft
         for i in range(len(acs)):
             for j in range(i + 1, len(acs)):
-                a, b = acs[i], acs[j]
+                a, b     = acs[i], acs[j]
                 lateral  = math.hypot(a.x - b.x, a.y - b.y)
                 vertical = abs(a.altitude - b.altitude)
                 if lateral < 3.0 and vertical < 1000:
                     conflicts.append({
-                        "ac1": a.callsign, "ac2": b.callsign,
-                        "lateral_nm": round(lateral, 2),
+                        "ac1":         a.callsign,
+                        "ac2":         b.callsign,
+                        "lateral_nm":  round(lateral, 2),
                         "vertical_ft": round(vertical, 0),
                     })
         return conflicts
