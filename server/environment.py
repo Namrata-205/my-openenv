@@ -338,9 +338,10 @@ class ATCEnvironment:
         raw_reward, log = self._emerg_env.insert_emergency(heading, altitude, insert_time)
 
         n_traffic   = len(self._emerg_env.traffic)
-        max_urgency = 2.0
-        worst_raw   = -22 * max_urgency * n_traffic - 12
-        best_raw    = 18 * max_urgency + 4
+        # Worst case: -22 per violation (all traffic) -12 flow breakdown
+        # Best case:  +18 insertion + +4 flow + +5 alignment + ~+6 urgency bonus
+        worst_raw   = -22 * n_traffic - 12
+        best_raw    = 18 + 4 + 5 + 6
         norm        = self._normalise(raw_reward, low=worst_raw, high=best_raw)
 
         self._aircraft = self._aircraft_from_emergency(self._emerg_env)
@@ -369,12 +370,17 @@ class ATCEnvironment:
         return norm, round(score, 4), violations, info
 
     def _step_conflict(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
-        action_str                       = self._action_to_conflict_str(actions)
-        raw_reward, desc, sep, vert_sep  = self._conflict_env.step(action_str)
-        norm                             = self._normalise(raw_reward, low=-25, high=25)
-        self._aircraft                   = self._aircraft_from_conflict(self._conflict_env)
+        action_str                            = self._action_to_conflict_str(actions)
+        raw_reward, desc, sep, vert_sep       = self._conflict_env.step(action_str)
 
-        # sep and vert_sep are PRE-tick (current positions when action was applied)
+        # Normalisation range:
+        #   low  = -15 (crit proximity) -5 (sep worse) = -20, padded to -25
+        #   high = +10 (safe+on-course) + safe_seconds streak (up to ~MAX_STEPS*2=60)
+        #          + time bonus — use 80 as safe ceiling
+        norm           = self._normalise(raw_reward, low=-25, high=80)
+        self._aircraft = self._aircraft_from_conflict(self._conflict_env)
+
+        # Post-tick horizontal separation drives violations
         violations = ([f"CRITICAL PROXIMITY: {sep:.2f} NM"]
                       if sep < 5.0 and vert_sep < 1000 else [])
 

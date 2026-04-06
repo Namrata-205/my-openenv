@@ -442,6 +442,7 @@ class ConflictAircraftState:
     speed_kts:   float
     heading_deg: float = 90.0
     target_hdg:  float = 90.0   # desired final heading (degrees)
+    altitude:    float = 8000.0  # feet MSL — kept for environment.py compatibility
 
     def tick(self, dt_min: float = 1.0):
         """Advance position by dt_min minutes along current heading/speed."""
@@ -574,7 +575,11 @@ class ConflictAlertEnv:
 
         description = " | ".join(log_parts)
         description += f" | sep={sep_after:.2f}NM reward={reward:.1f}"
-        return round(reward, 2), description, sep_after
+        # Return 4 values: (reward, description, horiz_sep, vert_sep)
+        # vert_sep derived from altitude difference (always 0 if altitudes equal).
+        # environment.py unpacks: raw_reward, desc, sep, vert_sep
+        vert_sep = abs(self.ac1.altitude - self.ac2.altitude)
+        return round(reward, 2), description, sep_after, vert_sep
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
