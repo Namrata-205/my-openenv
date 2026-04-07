@@ -172,16 +172,7 @@ def sequence_flights(
     runway_free_at = 0.0
     total_reward   = 0.0
     events: List[str] = []
-
-    if strategy == "fcfs":
-        flights.sort(key=lambda f: f.eta_min)
-    elif strategy == "fuel_priority":
-        # Lowest fuel first — they have least buffer and must land soonest
-        flights.sort(key=lambda f: f.fuel_lbs)
-    elif strategy == "eta_optimized":
-        # Sort by ETA but bump low-fuel planes forward if they'd go-around otherwise
-        flights.sort(key=lambda f: (f.eta_min if f.fuel_lbs >= 3000 else f.eta_min - 20))
-    # "rl_agent" → keep existing order
+    # NOTE: sorting was already done above; do NOT re-sort here.
 
     for f in flights:
         # Earliest the runway is available for this flight
@@ -331,6 +322,15 @@ class EmergencyVectorEnv:
             self.inserted = True
             log.append("INSERTION CONFIRMED — terminal")
 
+        # Summary metrics for the header line
+        dist_nm   = math.hypot(
+            self.emergency.lat - (sum(a.lat for a in self.traffic) / max(1, len(self.traffic))),
+            self.emergency.lon - (sum(a.lon for a in self.traffic) / max(1, len(self.traffic))),
+        )
+        runway_heading = 180.0
+        hdg_error = abs(heading - runway_heading) % 360
+        hdg_error = min(hdg_error, 360 - hdg_error)
+
         log.insert(0,
             f"Vector heading={heading:.0f}° alt={altitude:.0f}ft "
             f"dist={dist_nm:.1f}NM hdg_err={hdg_error:.0f}° "
@@ -419,7 +419,7 @@ class ConflictAlertEnv:
 
         elif action == "ac2_speed_10":
             self.ac2.speed_kts = min(350, self.ac2.speed_kts + 10)
-            description        = "AC2 accelerate 10 kts"
+            log_parts.append(f"AC2 accelerate 10kts → {self.ac2.speed_kts:.0f}kts")
 
         # Score on PRE-tick positions (current separation before movement)
         horiz_sep = self._separation()

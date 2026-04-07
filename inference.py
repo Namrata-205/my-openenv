@@ -384,24 +384,25 @@ def call_llm(state: Dict, step: int) -> List[Dict]:
             ]
 
         return _fallback_action(state, "No conflict detected")
-        # ================================================================
-        # TASK 3: EMERGENCY VECTORING
-        # ================================================================
-        if task == "emergency_vectoring":
-            aircraft = state.get("aircraft", [])
-            emerg = next((a for a in aircraft if a.get("is_emergency")), None)
 
-            if not emerg:
-                return _fallback_action(state, "No emergency aircraft")
+    # ================================================================
+    # TASK 3: EMERGENCY VECTORING
+    # ================================================================
+    if task == "emergency_vectoring":
+        aircraft = state.get("aircraft", [])
+        emerg = next((a for a in aircraft if a.get("is_emergency")), None)
 
-            return [{
-                "action_type":      "vector",
-                "target_callsign":  emerg["callsign"],
-                "value":            270,
-                "secondary_target": None,
-                "gate_id":          None,
-                "rationale":        "Direct emergency aircraft to runway 28L/R",
-            }]
+        if not emerg:
+            return _fallback_action(state, "No emergency aircraft")
+
+        return [{
+            "action_type":      "vector",
+            "target_callsign":  emerg["callsign"],
+            "value":            180,
+            "secondary_target": None,
+            "gate_id":          None,
+            "rationale":        "Direct emergency aircraft toward runway heading 180°",
+        }]
 
     # ================================================================
     # TASK 2: GO-AROUND PREVENTION
@@ -412,7 +413,7 @@ def call_llm(state: Dict, step: int) -> List[Dict]:
         if not aircraft:
             return _fallback_action(state, "No aircraft")
 
-        import math
+        import math  # already at module top — kept for clarity
 
         # Helper: distance from runway threshold
         def dist(a):

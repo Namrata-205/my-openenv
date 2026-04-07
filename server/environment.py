@@ -293,7 +293,7 @@ class ATCEnvironment:
         return reward_norm, round(score, 4), violations, info
 
     def _step_go_around(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
-        strategy     = self._action_to_strategy(actions)
+        strategy     = self._action_to_go_around_strategy(actions)
         flights_copy = [
             InboundFlight(f.callsign, f.eta_min, f.fuel_lbs, f.priority)
             for f in self._flights
@@ -324,7 +324,7 @@ class ATCEnvironment:
         return norm, score, violations, info
 
     def _step_emergency(self, actions: List[ATCAction]) -> Tuple[float, float, List[str], Dict]:
-        heading, altitude = self._action_to_vector_2d(actions)
+        heading, altitude = self._action_to_vector(actions)
         insert_time = self._action_to_time(actions)
         raw_reward, log = self._emerg_env.insert_emergency(heading, altitude, insert_time)
 
@@ -434,12 +434,11 @@ class ATCEnvironment:
                 return "increase_heading_gap"
         return "hold"
 
-    def _action_to_strategy(self, actions: List[ATCAction]) -> str:
-        return "rl_agent"  # default for go-around
-
     def _action_to_vector_2d(self, actions: List[ATCAction]) -> Tuple[float, float]:
-        heading = 240.0
-        altitude = 5500.0
+        """Kept for API compatibility; delegates to _action_to_vector."""
+        return self._action_to_vector(actions)
+
+    def _action_to_go_around_strategy(self, actions: List[ATCAction]) -> str:
         for a in actions:
             if a.action_type == ActionType.SEQUENCE_SWAP:
                 hint = (a.rationale or "").lower()
