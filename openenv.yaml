@@ -1,171 +1,152 @@
-openenv_version: "1.0"
-
 name: atc-tracon-rl
-version: "1.0.0"
+version: "1.2.0"
 description: >
-  Reinforcement Learning environment for Air Traffic Control decision support
-  in TRACON (Terminal Radar Approach Control) scenarios. Provides minimal,
-  interpretable advisory actions to assist human controllers.
+  Air Traffic Control (ATC) TRACON RL Environment.
+  Five procedural tasks covering wake-turbulence separation, go-around
+  prevention, emergency vectoring, conflict resolution, and gate assignment.
+  Scores are normalised to [0, 1] per episode.
 
-author: "ATC RL Team"
-license: MIT
+server:
+  dockerfile: Dockerfile
+  port: 7860
+  healthcheck:
+    path: /health
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    description: Reset the environment and return the initial state.
+    request_schema:
+      type: object
+      properties:
+        task:
+          type: string
+          enum:
+            - wake_turbulence
+            - go_around_prevention
+            - emergency_vectoring
+            - conflict_resolution
+            - gate_assignment
+          description: Task to run. Omit to choose randomly.
+        seed:
+          type: integer
+          description: Optional RNG seed for reproducibility.
+        options:
+          type: object
+          description: Extra options forwarded to the environment (e.g. max_steps).
+
+  step:
+    method: POST
+    path: /step
+    description: Advance the environment by one step.
+    request_schema:
+      type: object
+      required: [actions]
+      properties:
+        actions:
+          type: array
+          items:
+            type: object
+            required: [action_type, target_callsign]
+            properties:
+              action_type:
+                type: string
+                enum:
+                  - speed_change
+                  - heading_change
+                  - altitude_change
+                  - sequence_swap
+                  - assign_gate
+                  - vector
+                  - no_action
+              target_callsign:
+                type: string
+              value:
+                type: number
+              gate_id:
+                type: string
+              rationale:
+                type: string
+
+  state:
+    method: GET
+    path: /state
+    description: Return the current state without advancing the episode.
+
+  tasks:
+    method: GET
+    path: /tasks
+    description: Return list of all supported task names.
 
 tasks:
-  - id: wake_turbulence
-    name: Wake Turbulence Separation
+  - name: wake_turbulence
     description: >
-      Maintain safe wake-turbulence spacing between sequenced aircraft
-      by issuing heading or speed adjustments.
-    observation_space:
-      type: structured
-      fields:
-        - name: aircraft
-          type: array[AircraftState]
-        - name: separation_matrix
-          type: dict[string, float]
-    action_space:
-      type: structured
-      allowed_actions:
-        - heading_change
-        - speed_change
-        - sequence_swap
-    reward:
-      type: continuous
-      range: [0.0, 1.0]
-      description: >
-        Mean ratio of actual vs required separation across all consecutive pairs.
+      Maintain FAA-compliant wake-turbulence separation between a leading
+      and trailing aircraft pair.
+    max_steps: 40
+    score_range: [0.0, 1.0]
+    reward_shaping:
+      perfect_spacing: +15
+      loss_of_separation: -25
 
-  - id: go_around_prevention
-    name: Go-Around Prevention via Sequencing
+  - name: go_around_prevention
     description: >
-      Optimise landing order so faster aircraft lead slower ones,
-      preventing go-arounds and fuel emergencies.
-    observation_space:
-      type: structured
-      fields:
-        - name: aircraft
-          type: array[AircraftState]
-    action_space:
-      type: structured
-      allowed_actions:
-        - sequence_swap
-        - speed_change
-    reward:
-      type: continuous
-      range: [0.0, 1.0]
-      description: >
-        Fraction of correctly ordered pairs with a fuel-state bonus.
+      Optimise the inbound landing sequence to prevent go-arounds while
+      managing fuel-critical aircraft.
+    max_steps: 40
+    score_range: [0.0, 1.0]
+    reward_shaping:
+      low_go_around_rate: +12
+      per_go_around: -20
+      holding_per_min: -8
 
-  - id: emergency_vectoring
-    name: Emergency Vectoring
+  - name: emergency_vectoring
     description: >
-      Vector a MAYDAY aircraft to the runway as quickly as possible,
-      clearing traffic and aligning the aircraft correctly.
-    observation_space:
-      type: structured
-      fields:
-        - name: aircraft
-          type: array[AircraftState]
-        - name: runways
-          type: array[RunwayState]
-    action_space:
-      type: structured
-      allowed_actions:
-        - vector
-        - heading_change
-        - sequence_swap
-    reward:
-      type: continuous
-      range: [0.0, 1.0]
-      description: >
-        Weighted combination of runway proximity, heading alignment,
-        and fuel urgency for the emergency aircraft.
+      Vector a MAYDAY aircraft to the runway conflict-free as quickly as
+      possible.
+    max_steps: 40
+    score_range: [0.0, 1.0]
+    reward_shaping:
+      fast_clean_insertion: +18
+      conflict_penalty: -22
 
-  - id: conflict_resolution
-    name: Conflict Alert Resolution
+  - name: conflict_resolution
     description: >
-      Resolve lateral and vertical conflicts between aircraft using
-      the fewest and smallest corrective actions.
-    observation_space:
-      type: structured
-      fields:
-        - name: aircraft
-          type: array[AircraftState]
-        - name: active_conflicts
-          type: array[ConflictInfo]
-    action_space:
-      type: structured
-      allowed_actions:
-        - heading_change
-        - altitude_change
-        - speed_change
-    reward:
-      type: continuous
-      range: [0.0, 1.0]
-      description: >
-        1 - (active_conflicts / number_of_aircraft).
+      Resolve converging aircraft pair with minimal heading or speed
+      corrections.
+    max_steps: 40
+    score_range: [0.0, 1.0]
+    reward_shaping:
+      safely_separated_on_course: +10
+      critical_proximity: -15
 
-  - id: gate_assignment
-    name: Gate / Stand Assignment
+  - name: gate_assignment
     description: >
-      Assign landed aircraft to compatible, unoccupied gates efficiently.
-    observation_space:
-      type: structured
-      fields:
-        - name: aircraft
-          type: array[AircraftState]
-        - name: gates
-          type: array[GateState]
-    action_space:
-      type: structured
-      allowed_actions:
-        - assign_gate
-    reward:
-      type: continuous
-      range: [0.0, 1.0]
-      description: >
-        Weighted combination of assignment rate and gate compatibility.
+      Assign arriving aircraft to the best available compatible gate
+      from the pool A1, A2, B1, B2, C1, C2.
+    max_steps: 40
+    score_range: [0.0, 1.0]
+    reward_shaping:
+      quick_valid_assignment: +15
+      occupied_or_incompatible: -20
 
-api:
-  endpoints:
-    reset:
-      method: POST
-      path: /reset
-      request_schema: ResetRequest
-      response_schema: EnvironmentState
-    step:
-      method: POST
-      path: /step
-      request_schema: StepRequest
-      response_schema: StepResult
-    state:
-      method: GET
-      path: /state
-      response_schema: EnvironmentState
-    health:
-      method: GET
-      path: /health
-      response_schema: HealthResponse
-
-environment:
-  observation_type: structured_json
-  action_type: structured_json
-  reward_range: [0.0, 1.0]
-  max_steps: 30
-  deterministic: false
-
-models:
-  typed: true
-  library: pydantic
-  schema_file: models.py
-
-inference:
-  script: inference.py
-  required_env_vars:
-    - API_BASE_URL
-    - MODEL_NAME
-    - HF_TOKEN
-  log_format:
-    start_token: "[START]"
-    step_token: "[STEP]"
-    end_token: "[END]"
+environment_variables:
+  required: []
+  optional:
+    - name: API_BASE_URL
+      description: URL of the running environment server.
+      default: "http://localhost:7860"
+    - name: MODEL_NAME
+      description: LLM model identifier used by inference.py.
+      default: "mistralai/Mistral-7B-Instruct-v0.2"
+    - name: HF_TOKEN
+      description: HuggingFace API token for LLM inference.
+    - name: GROK_API_KEY
+      description: xAI Grok API key for secondary LLM fallback.
+    - name: GROK_MODEL
+      description: Grok model identifier.
+      default: "grok-3-mini"
