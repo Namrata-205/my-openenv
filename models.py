@@ -79,6 +79,8 @@ class ATCAction(BaseModel):
     secondary_target: Optional[str]   = None
     gate_id:          Optional[str]   = None
     rationale:        Optional[str]   = None
+    altitude:         Optional[float] = None
+    time:             Optional[float] = None
 
     class Config:
         use_enum_values = True
