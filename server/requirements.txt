@@ -1,7 +1,9 @@
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-pydantic>=2.7.1
-requests>=2.32.2
-openai>=1.30.0
-httpx>=0.27.0
-python-multipart>=0.0.9
+anthropic==0.26.0
+httpx==0.27.0
+python-multipart==0.0.9
+# ATC TRACON RL Environment — server dependencies
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+requests==2.32.3
+openai==1.58.1
