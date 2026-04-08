@@ -16,7 +16,7 @@ if "state" not in st.session_state:
 # Helper function to get aircraft/entities list dynamically
 def get_aircraft_list(state_json):
     for key in ["aircraft", "planes", "entities"]:
-        if key in state_json:
+        if key in state_json and isinstance(state_json[key], list):
             return state_json[key]
     return []
 
@@ -54,12 +54,14 @@ if st.session_state["state"] is not None:
     if not aircraft_list:
         st.warning("No aircraft/planes found in response!")
     else:
-        # Print aircraft info
+        # Print aircraft info safely
         for ac in aircraft_list:
             st.write(
                 f"Callsign: {ac.get('callsign', 'N/A')}, "
-                f"X: {ac.get('x', 0):.2f}, Y: {ac.get('y', 0):.2f}, "
-                f"Alt: {ac.get('altitude', 0):.2f}, Heading: {ac.get('heading', 0):.2f}"
+                f"X: {float(ac.get('x', 0) or 0):.2f}, "
+                f"Y: {float(ac.get('y', 0) or 0):.2f}, "
+                f"Alt: {float(ac.get('altitude', 0) or 0):.2f}, "
+                f"Heading: {float(ac.get('heading', 0) or 0):.2f}"
             )
 
         # Wake turbulence check
@@ -67,8 +69,9 @@ if st.session_state["state"] is not None:
             for j in range(i + 1, len(aircraft_list)):
                 ac1 = aircraft_list[i]
                 ac2 = aircraft_list[j]
-                dx = ac1.get("x", 0) - ac2.get("x", 0)
-                dy = ac1.get("y", 0) - ac2.get("y", 0)
+                x1, y1 = float(ac1.get("x", 0) or 0), float(ac1.get("y", 0) or 0)
+                x2, y2 = float(ac2.get("x", 0) or 0), float(ac2.get("y", 0) or 0)
+                dx, dy = x1 - x2, y1 - y2
                 dist = (dx ** 2 + dy ** 2) ** 0.5
                 if dist < 5:  # threshold for turbulence
                     st.warning(
