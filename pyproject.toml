@@ -32,7 +32,7 @@ dev = [
 atc-tracon-server = "server.app:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["server","my_env"]
+packages = ["server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

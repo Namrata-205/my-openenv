@@ -3,18 +3,13 @@ app.py — FastAPI server for the ATC TRACON RL Environment.
 """
 from __future__ import annotations
 
-import sys
-import os
-from typing import List
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from models import (
+from .models import (
     ATCAction,
     EnvironmentState,
     HealthResponse,
@@ -22,7 +17,7 @@ from models import (
     StepResult,
     TaskType,
 )
-from environment import ATCEnvironment
+from .environment import ATCEnvironment
 
 
 class StepRequest(BaseModel):
@@ -32,6 +27,7 @@ class StepRequest(BaseModel):
 app = FastAPI(
     title="ATC TRACON RL Environment",
     version="1.0.0",
+    description="OpenEnv-compliant Reinforcement Learning environment for ATC TRACON decision support",
 )
 
 app.add_middleware(
@@ -53,13 +49,14 @@ def health():
         tasks=[t.value for t in TaskType],
     )
 
+
 @app.get("/", response_model=HealthResponse)
 def root():
     return health()
 
 
 @app.post("/reset", response_model=EnvironmentState)
-def reset(request: ResetRequest = None):
+def reset(request: Optional[ResetRequest] = None):
     global _initialized
     if request is None:
         request = ResetRequest()
@@ -80,7 +77,7 @@ def step(request: StepRequest):
 
 
 @app.get("/state", response_model=EnvironmentState)
-def state():
+def get_state():
     if not _initialized:
         raise HTTPException(status_code=400, detail="Call /reset before /state")
     return _env.state()
