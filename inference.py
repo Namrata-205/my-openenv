@@ -413,7 +413,6 @@ def call_llm(state: Dict, step: int) -> List[Dict]:
         if not aircraft:
             return _fallback_action(state, "No aircraft")
 
-        import math  # already at module top — kept for clarity
 
         # Helper: distance from runway threshold
         def dist(a):
