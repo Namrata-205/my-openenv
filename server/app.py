@@ -3,13 +3,19 @@ app.py — FastAPI server for the ATC TRACON RL Environment.
 """
 from __future__ import annotations
 
+import sys
+import os
 from typing import List, Optional
+
+# Add the parent directory (root folder) to Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .models import (
+# Import from root folder (parent directory)
+from models import (
     ATCAction,
     EnvironmentState,
     HealthResponse,
@@ -17,7 +23,7 @@ from .models import (
     StepResult,
     TaskType,
 )
-from .environment import ATCEnvironment
+from server.environment import ATCEnvironment
 
 
 class StepRequest(BaseModel):
@@ -126,7 +132,7 @@ def task_info(task_name: str):
 def main():
     """Main entry point for OpenEnv multi-mode deployment"""
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=False)
 
 
 if __name__ == "__main__":

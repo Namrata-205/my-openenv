@@ -1,17 +1,14 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "atc-tracon-rl"
 version = "1.0.0"
-description = "OpenEnv-compliant Reinforcement Learning environment for ATC TRACON decision support"
-readme = "README.md"
-license = { text = "MIT" }
+description = "ATC TRACON RL Environment for OpenEnv"
 requires-python = ">=3.10"
-keywords = ["reinforcement-learning", "air-traffic-control", "RL", "openenv", "TRACON"]
-
 dependencies = [
+    "openenv-core[core]>=0.2.2",
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
     "pydantic>=2.7.1",
@@ -19,7 +16,6 @@ dependencies = [
     "anthropic>=0.26.0",
     "httpx>=0.27.0",
     "python-multipart>=0.0.9",
-    "openenv-core>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -28,12 +24,11 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
 ]
+
 [project.scripts]
-atc-tracon-server = "server.app:main"
+server = "env.server.app:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["server"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"
+[tool.setuptools]
+include-package-data = true
+packages = ["env", "env.server"]
+package-dir = { "env" = ".", "env.server" = "server" }
