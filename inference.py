@@ -1,5 +1,6 @@
 """
 inference.py — ATC TRACON RL Environment inference script.
+Uses LiteLLM proxy as required by the hackathon.
 """
 
 from __future__ import annotations
@@ -16,46 +17,63 @@ from openai import OpenAI
 
 
 # ── Environment variables ──────────────────────────────────────────────────────
-API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:7860")
-API_KEY      = os.environ.get("API_KEY", "dummy")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+# Your environment server URL (your FastAPI app)
+ENV_SERVER_URL = os.environ.get("API_BASE_URL", "http://localhost:7860")
+
+# LiteLLM proxy URL (validator's LLM service) - DIFFERENT from API_BASE_URL!
+LLM_PROXY_URL = os.environ.get("LLM_API_BASE_URL", "")
+LLM_API_KEY = os.environ.get("API_KEY", "")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 
 DEFAULT_TASK = "conflict_resolution"
-MAX_STEPS    = 10
-MAX_RETRIES  = 3
-RETRY_DELAY  = 1.0
+MAX_STEPS = 10
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0
 
 
-# ── OpenAI-compatible client pointing at the validator's LiteLLM proxy ─────────
-# CRITICAL: Must use the exact environment variables provided by validator
-llm_client = OpenAI(
-    base_url=API_BASE_URL,  # Using the environment variable directly
-    api_key=API_KEY,         # Using the environment variable directly
-)
+# ── LiteLLM Proxy Client (REQUIRED by hackathon) ──────────────────────────────
+# CRITICAL: This MUST use LLM_PROXY_URL, NOT API_BASE_URL!
+llm_client = None
+if LLM_PROXY_URL and LLM_API_KEY:
+    llm_client = OpenAI(
+        base_url=LLM_PROXY_URL,
+        api_key=LLM_API_KEY,
+    )
+    print(f"[INFO] LiteLLM proxy configured at {LLM_PROXY_URL}")
+else:
+    print(f"[WARN] LiteLLM proxy not configured - LLM_PROXY_URL='{LLM_PROXY_URL}', API_KEY present={bool(LLM_API_KEY)}")
 
 
 # ── Server availability check ─────────────────────────────────────────────────
 
-def is_server_ready(max_attempts: int = 3) -> bool:
+def is_server_ready(max_attempts: int = 15, wait_seconds: int = 2) -> bool:
+    """Check if the environment server is ready to accept requests."""
+    print(f"[INFO] Checking if environment server is ready at {ENV_SERVER_URL}...")
+    
     for attempt in range(max_attempts):
         try:
-            response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+            response = requests.get(f"{ENV_SERVER_URL}/health", timeout=5)
             if response.status_code == 200:
-                print(f"[INFO] Server ready at {API_BASE_URL}")
+                print(f"[INFO] Environment server is ready after {attempt + 1} attempt(s)")
                 return True
             print(f"[INFO] Health check attempt {attempt + 1}: status {response.status_code}")
         except requests.exceptions.ConnectionError:
-            print(f"[INFO] Server not reachable at {API_BASE_URL} (attempt {attempt + 1})")
+            print(f"[INFO] Server not reachable (attempt {attempt + 1}/{max_attempts})")
         except Exception as e:
             print(f"[INFO] Health check failed: {e}")
+        
         if attempt < max_attempts - 1:
-            time.sleep(2)
+            print(f"[INFO] Waiting {wait_seconds}s before next attempt...")
+            time.sleep(wait_seconds)
+    
+    print(f"[WARN] Server not ready after {max_attempts} attempts")
     return False
 
 
 # ── HTTP helpers with retry ───────────────────────────────────────────────────
 
 def _post_with_retry(url: str, payload: Dict, label: str) -> Dict:
+    """POST with exponential-backoff retry on 5xx responses."""
     delay = RETRY_DELAY
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -76,15 +94,15 @@ def env_reset(task: str, seed: Optional[int] = None) -> Dict:
     payload: Dict[str, Any] = {"task": task}
     if seed is not None:
         payload["seed"] = seed
-    return _post_with_retry(f"{API_BASE_URL}/reset", payload, "env_reset")
+    return _post_with_retry(f"{ENV_SERVER_URL}/reset", payload, "env_reset")
 
 
 def env_step(actions: List[Dict]) -> Dict:
-    return _post_with_retry(f"{API_BASE_URL}/step", {"actions": actions}, "env_step")
+    return _post_with_retry(f"{ENV_SERVER_URL}/step", {"actions": actions}, "env_step")
 
 
 def env_state() -> Dict:
-    r = requests.get(f"{API_BASE_URL}/state", timeout=30)
+    r = requests.get(f"{ENV_SERVER_URL}/state", timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -204,7 +222,6 @@ def safe_parse_actions(text: str, state: Dict) -> List[Dict]:
     # Remove markdown code blocks if present
     if cleaned.startswith("```"):
         lines = cleaned.split("\n")
-        # Remove first and last line if they are code fences
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
@@ -216,30 +233,21 @@ def safe_parse_actions(text: str, state: Dict) -> List[Dict]:
         if not isinstance(actions, list):
             actions = [actions]
         
-        # Validate and clean actions
         validated_actions = []
         for action in actions:
-            # Ensure required fields exist
-            if "action_type" not in action:
+            if "action_type" not in action or "target_callsign" not in action:
                 continue
-            if "target_callsign" not in action:
-                continue
-            
-            # Validate callsign is not "ALL"
             if action["target_callsign"] == "ALL":
-                # Try to find a valid callsign from state
                 if state.get("aircraft"):
                     action["target_callsign"] = state["aircraft"][0].get("callsign", "AAL201")
                 else:
                     continue
-            
             validated_actions.append(action)
         
         return validated_actions if validated_actions else _fallback_action(state, "No valid actions parsed")
         
     except Exception as exc:
         print(f"[WARN] JSON parse error: {exc}")
-        print(f"[WARN] Raw response: {text[:200]}...")
         return _fallback_action(state, f"JSON parse error: {exc}")
 
 
@@ -266,7 +274,13 @@ def call_llm_proxy(state: Dict, step: int) -> List[Dict]:
     Call the validator-injected LiteLLM proxy (OpenAI-compatible).
     This MUST be used for all decision-making to satisfy validator checks.
     """
-    print(f"[LLM] Calling proxy at {API_BASE_URL} with model {MODEL_NAME}")
+    if not llm_client:
+        print(f"[LLM] ERROR: LiteLLM proxy not configured!")
+        print(f"[LLM] LLM_PROXY_URL='{LLM_PROXY_URL}'")
+        print(f"[LLM] API_KEY present={bool(LLM_API_KEY)}")
+        raise ValueError("LiteLLM proxy not configured - missing LLM_PROXY_URL or API_KEY")
+    
+    print(f"[LLM] Calling proxy at {LLM_PROXY_URL} with model {MODEL_NAME}")
     
     try:
         response = llm_client.chat.completions.create(
@@ -279,13 +293,13 @@ def call_llm_proxy(state: Dict, step: int) -> List[Dict]:
             max_tokens=800,
         )
         
-        print(f"[LLM] Proxy call successful, received response")
+        print(f"[LLM] Proxy call successful")
         raw_text = response.choices[0].message.content or ""
         return safe_parse_actions(raw_text, state)
         
     except Exception as exc:
         print(f"[LLM] Proxy call failed: {exc}")
-        raise  # Re-raise to trigger fallback
+        raise
 
 
 # ── Main agent: ALWAYS use LLM proxy ──────────────────────────────────────────
@@ -305,26 +319,24 @@ def get_actions(state: Dict, step: int) -> List[Dict]:
         return actions
     except Exception as exc:
         print(f"[STEP] LLM proxy failed: {exc}")
-        # Only use fallback if LLM proxy completely fails
-        return _fallback_action(state, f"LLM proxy error: {exc}")
+        # Re-raise to make it clear that proxy is required
+        raise RuntimeError(f"LLM proxy required but failed: {exc}")
 
 
 # ── Main inference loop ───────────────────────────────────────────────────────
 
 def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
     print("[START]")
-    print(f"[INFO] Using API_BASE_URL: {API_BASE_URL}")
-    print(f"[INFO] Using MODEL_NAME: {MODEL_NAME}")
+    print(f"[INFO] ENV_SERVER_URL: {ENV_SERVER_URL}")
+    print(f"[INFO] LLM_PROXY_URL: {LLM_PROXY_URL if LLM_PROXY_URL else 'NOT SET'}")
+    print(f"[INFO] MODEL_NAME: {MODEL_NAME}")
 
     if not is_server_ready():
         print("[INFO] Server not ready — exiting gracefully")
         print("[END]")
         return
 
-    print(
-        f"[STEP] Initialising environment at {API_BASE_URL} | "
-        f"task={task} | model={MODEL_NAME} | seed={seed}"
-    )
+    print(f"[STEP] Initialising environment at {ENV_SERVER_URL} | task={task}")
 
     try:
         state = env_reset(task, seed=seed)
@@ -333,15 +345,12 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
         print("[END]")
         return
 
-    print(
-        f"[STEP] Environment reset. Task: {state.get('task')} | "
-        f"Aircraft: {len(state.get('aircraft', []))}"
-    )
+    print(f"[STEP] Environment reset. Task: {state.get('task')} | Aircraft: {len(state.get('aircraft', []))}")
 
     cumulative_reward = 0.0
-    cumulative_score  = 0.0
-    total_violations  = 0
-    completed_steps   = 0
+    cumulative_score = 0.0
+    total_violations = 0
+    completed_steps = 0
     llm_calls_made = 0
 
     for step_num in range(1, MAX_STEPS + 1):
@@ -369,24 +378,21 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
             print(f"[STEP] step={step_num} | ENV ERROR: {exc}")
             break
 
-        state      = result["state"]
-        reward     = result.get("reward", 0.0)
-        score      = result.get("score",  0.0)
-        done       = result.get("done",   False)
+        state = result["state"]
+        reward = result.get("reward", 0.0)
+        score = result.get("score", 0.0)
+        done = result.get("done", False)
         violations = result.get("violations", [])
 
         cumulative_reward += reward
-        cumulative_score  += score
-        total_violations  += len(violations)
-        completed_steps    = step_num
+        cumulative_score += score
+        total_violations += len(violations)
+        completed_steps = step_num
 
         conflict_count = len(state.get("active_conflicts", []))
         viol_str = f" | violations={violations}" if violations else ""
 
-        print(
-            f"[STEP] step={step_num} | reward={reward:.4f} | score={score:.4f}"
-            f" | conflicts={conflict_count} | done={done}{viol_str}"
-        )
+        print(f"[STEP] step={step_num} | reward={reward:.4f} | score={score:.4f} | conflicts={conflict_count} | done={done}{viol_str}")
 
         if done:
             print(f"[STEP] Episode completed at step {step_num}.")
@@ -395,7 +401,7 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
         time.sleep(0.1)
 
     avg_reward = cumulative_reward / max(1, completed_steps)
-    avg_score  = cumulative_score  / max(1, completed_steps)
+    avg_score = cumulative_score / max(1, completed_steps)
 
     print(f"[STEP] ── Episode Summary ──────────────────────────")
     print(f"[STEP] Task:              {task}")
@@ -404,7 +410,6 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
     print(f"[STEP] Avg reward:        {avg_reward:.4f}")
     print(f"[STEP] Avg score:         {avg_score:.4f}")
     print(f"[STEP] Total violations:  {total_violations}")
-    print(f"[STEP] Final score range: [0.0, 1.0] ✓")
     print("[END]")
 
 
@@ -414,5 +419,5 @@ if __name__ == "__main__":
         _seed = int(sys.argv[2]) if len(sys.argv) > 2 else None
         run_inference(task=_task, seed=_seed)
     except Exception as e:
-        print(f"[INFO] Inference exited gracefully: {e}")
+        print(f"[INFO] Inference exited: {e}")
         sys.exit(0)
