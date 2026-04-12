@@ -1,19 +1,7 @@
 """
 graders.py — Task graders for the ATC TRACON RL Environment.
 
-Performance fixes in this revision:
-  - WakeTurbulenceEnv: perfect-spacing window widened (req → req+1.0 NM)
-    so agents can actually reach the +12 reward band during normal operation.
-  - EmergencyVectorEnv: `inserted` flag added; once a clean insertion is
-    confirmed the env freezes so the terminal condition in environment.py
-    fires reliably on the next step check.
-  - ConflictAlertEnv: `tick()` advances both aircraft along their current
-    headings each step so separation evolves naturally; heading/speed changes
-    now persistently alter the track rather than being one-shot x-bumps.
-  - Gate.blocked: only True when blocked_by is set AND gate is not already
-    occupied — prevents double-penalising occupied+blocked gates.
-  - GateAssignmentEnv.assign(): queue always advances (valid or not) so the
-    queue drains deterministically and terminal fires correctly.
+FIXED: Scores are now properly normalized to (0,1) range with bounds checking.
 """
 
 from __future__ import annotations
@@ -26,7 +14,7 @@ from enum import Enum
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TASK 1 — WAKE TURBULENCE  (unchanged — working correctly)
+# TASK 1 — WAKE TURBULENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AircraftCategory(Enum):
@@ -61,8 +49,32 @@ class WakeTurbulenceEnv:
     def violated(self) -> bool:
         return self.current_sep < self.required_sep
 
-    def step(self, action: str) -> Tuple[float, str]:
-        """Return (reward, log_string)."""
+    def get_normalized_score(self) -> float:
+        """
+        Calculate normalized score between 0 and 1 (exclusive bounds).
+        Score based on separation quality and delay.
+        """
+        req = self.required_sep
+        sep_ratio = self.current_sep / req
+        
+        # Perfect spacing: 1.0 to 2.0 above required
+        if self.current_sep >= req and self.current_sep <= req + 1.0:
+            base_score = 0.95
+        # Safe but not perfect
+        elif self.current_sep >= req:
+            base_score = 0.75 + min(0.15, (self.current_sep - req) / (req * 2))
+        # Violation - but still above 0
+        else:
+            base_score = max(0.05, self.current_sep / req) * 0.5
+        
+        # Delay penalty
+        delay_penalty = min(0.3, self.delay_sec / 200.0)
+        
+        final_score = max(0.05, min(0.95, base_score - delay_penalty))
+        return round(final_score, 4)
+
+    def step(self, action: str) -> Tuple[float, str, float]:
+        """Return (reward, log_string, normalized_score)."""
         reward    = 0.0
         req       = self.required_sep
         log_parts: List[str] = [f"action={action}"]
@@ -100,23 +112,51 @@ class WakeTurbulenceEnv:
         if self.delay_sec > 40:
             reward -= 5
             log_parts.append("delay penalty applied")
+        
+        normalized_score = self.get_normalized_score()
+        log_parts.append(f"score={normalized_score:.4f}")
 
-        return round(reward, 2), " | ".join(log_parts)
+        return round(reward, 2), " | ".join(log_parts), normalized_score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TASK 2 — GO-AROUND PREVENTION  (improved)
+# TASK 2 — GO-AROUND PREVENTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class InboundFlight:
     callsign:    str
-    eta_min:     float   # minutes from now to threshold
-    fuel_lbs:    float   # fuel remaining in lbs
-    priority:    int     # 1 = highest urgency
+    eta_min:     float
+    fuel_lbs:    float
+    priority:    int
     holding_min: float = 0.0
     landed:      bool  = False
     went_around: bool  = False
+
+
+def get_ga_prevention_score(flights: List[InboundFlight]) -> float:
+    """
+    Calculate normalized score for go-around prevention.
+    Score based on go-around rate and average holding time.
+    """
+    if not flights:
+        return 0.5
+    
+    go_around_count = sum(1 for f in flights if f.went_around)
+    ga_rate = go_around_count / len(flights)
+    
+    avg_holding = sum(f.holding_min for f in flights) / len(flights)
+    
+    # Score components: ga_rate (0-1), holding time impact
+    ga_score = max(0.0, 1.0 - ga_rate * 3)  # 3x penalty for go-arounds
+    holding_score = max(0.0, 1.0 - avg_holding / 15.0)  # 15 min = 0
+    
+    # Weighted combination
+    final_score = (ga_score * 0.7) + (holding_score * 0.3)
+    
+    # Ensure within (0,1) exclusive
+    final_score = max(0.05, min(0.95, final_score))
+    return round(final_score, 4)
 
 
 def sequence_flights(
@@ -126,41 +166,19 @@ def sequence_flights(
     """
     Sequence the given flight list using *strategy*.
     Returns (total_reward, events, stats).
-
-    Reward spec (matched exactly):
-      +12  go-around rate < 5%
-      +3   on-time landing (wait ≤ 1 min)
-      -20  each go-around
-      -8 × ceil(wait_min)  holding penalty per flight
     """
-
     # ── Sort by strategy ──────────────────────────────────────────────────────
     if strategy == "fcfs":
-        # Baseline: first come, first served by arrival time
         flights.sort(key=lambda f: f.eta_min)
-
     elif strategy == "fuel_priority":
-        # Low-fuel is urgent — but we break ties by ETA so we don't strand
-        # aircraft that are already on a short final while waiting for a low-fuel
-        # plane that is still 20 minutes out.
-        # Sort key: primary = fuel bucket (0-3000 = critical, else normal),
-        #           secondary = ETA within each bucket
         def fuel_key(f: InboundFlight) -> Tuple[int, float]:
             bucket = 0 if f.fuel_lbs < 3000 else 1
             return (bucket, f.eta_min)
         flights.sort(key=fuel_key)
-
     elif strategy == "eta_optimized":
-        # Pure ETA order — tightest deadline first, no hacks
         flights.sort(key=lambda f: f.eta_min)
-
     elif strategy == "rl_agent":
-        # Multi-factor RL policy:
-        #   - Low ETA aircraft land sooner (weight 0.4)
-        #   - Low fuel aircraft are treated as more urgent (weight 0.3, inverted)
-        #   - High priority (low number) aircraft are bumped forward (weight 3.0)
-        # Result: naturally avoids holding critical/low-fuel flights
-        MAX_FUEL = 10_000.0  # normalisation ceiling
+        MAX_FUEL = 10_000.0
         flights.sort(key=lambda f: (
             f.eta_min * 0.4
             + (f.fuel_lbs / MAX_FUEL) * 0.3
@@ -168,38 +186,31 @@ def sequence_flights(
         ))
 
     # ── Simulate runway operations ────────────────────────────────────────────
-    RUNWAY_OCC_MIN = 2.0   # runway occupancy time per landing (minutes)
+    RUNWAY_OCC_MIN = 2.0
     runway_free_at = 0.0
     total_reward   = 0.0
     events: List[str] = []
-    # NOTE: sorting was already done above; do NOT re-sort here.
 
     for f in flights:
-        # Earliest the runway is available for this flight
         landing_time  = max(f.eta_min, runway_free_at)
-        wait          = landing_time - f.eta_min  # holding time (≥ 0)
+        wait          = landing_time - f.eta_min
         f.holding_min = wait
 
-        # Go-around decision: too long a hold OR critically low fuel with any hold
         goes_around = wait > 8.0 or (f.fuel_lbs < 3_000 and wait > 4.0)
 
         if goes_around:
             f.went_around  = True
             total_reward  -= 20
             events.append(
-                f"{f.callsign}: GO-AROUND  "
-                f"wait={wait:.1f}min  fuel={f.fuel_lbs:.0f}lbs  → -20"
+                f"{f.callsign}: GO-AROUND  wait={wait:.1f}min  fuel={f.fuel_lbs:.0f}lbs  → -20"
             )
         else:
             f.landed       = True
             runway_free_at = landing_time + RUNWAY_OCC_MIN
-
             if wait <= 1.0:
-                # On-time landing
                 total_reward += 3
                 events.append(f"{f.callsign}: ON-TIME  wait={wait:.1f}min  → +3")
             else:
-                # Holding penalty: -8 per each full minute (or part thereof)
                 hold_penalty  = -8 * math.ceil(wait)
                 total_reward += hold_penalty
                 events.append(
@@ -207,20 +218,18 @@ def sequence_flights(
                     f"hold_penalty={hold_penalty:.0f}"
                 )
 
-    # ── Go-around rate bonus ──────────────────────────────────────────────────
     go_around_count = sum(1 for f in flights if f.went_around)
     landed_count    = sum(1 for f in flights if f.landed)
     ga_rate         = go_around_count / len(flights) if flights else 0.0
 
     if ga_rate < 0.05:
         total_reward += 12
-        events.append(
-            f"BONUS: go-around rate {ga_rate*100:.1f}% < 5%  → +12"
-        )
+        events.append(f"BONUS: go-around rate {ga_rate*100:.1f}% < 5%  → +12")
     else:
-        events.append(
-            f"INFO:  go-around rate {ga_rate*100:.1f}%  (need <5% for bonus)"
-        )
+        events.append(f"INFO: go-around rate {ga_rate*100:.1f}%  (need <5% for bonus)")
+    
+    normalized_score = get_ga_prevention_score(flights)
+    events.append(f"score={normalized_score:.4f}")
 
     stats = {
         "strategy":      strategy,
@@ -229,56 +238,59 @@ def sequence_flights(
         "ga_rate_pct":   round(ga_rate * 100, 1),
         "total_reward":  round(total_reward, 2),
         "total_holding": round(sum(f.holding_min for f in flights), 2),
+        "normalized_score": normalized_score,
     }
     return round(total_reward, 2), events, stats
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TASK 3 — EMERGENCY VECTORING  (improved)
+# TASK 3 — EMERGENCY VECTORING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Aircraft:
     callsign:   str
-    heading:    float    # degrees
-    altitude:   float    # feet MSL
-    speed:      float    # knots
-    lat:        float    # 2-D position (1 unit ≈ 1 NM)
+    heading:    float
+    altitude:   float
+    speed:      float
+    lat:        float
     lon:        float
-    fuel_state: float = 1.0   # 0.0 (empty) – 1.0 (full)
+    fuel_state: float = 1.0
 
 
 @dataclass
 class EmergencyVectorEnv:
     emergency: Aircraft
     traffic:   List[Aircraft]
-    # FIX: once a clean, fast insertion is achieved, freeze the env so the
-    # terminal flag fires on the very next environment.py done-check rather
-    # than looping forever with done=False.
     inserted:  bool = False
+    
+    def get_normalized_score(self) -> float:
+        """Calculate normalized score for emergency vectoring."""
+        if self.inserted:
+            # Successfully inserted
+            fuel_bonus = self.emergency.fuel_state
+            return max(0.5, min(0.95, 0.7 + fuel_bonus * 0.25))
+        else:
+            # Not yet inserted
+            fuel_factor = max(0.1, self.emergency.fuel_state)
+            return max(0.05, min(0.45, fuel_factor * 0.3))
 
     def insert_emergency(
         self,
         heading:     float,
         altitude:    float,
         insert_time: float = 1.0,
-    ) -> Tuple[float, List[str]]:
+    ) -> Tuple[float, List[str], float]:
         """
-        Vector the emergency aircraft to *heading* / *altitude* and check
-        whether the resulting position is conflict-free.
-
-        Reward spec (matched exactly):
-          +18  conflict-free insertion in ≤ 2 min
-          +4   throughput drop < 10%  (no blocking conflicts)
-          -22  each safety violation (< 3 NM lateral AND < 1000 ft vertical)
-          -12  flow breakdown (≥ 10% throughput degradation)
+        Vector the emergency aircraft.
+        Returns (reward, log_lines, normalized_score).
         """
         if self.inserted:
-            # Already inserted — return stable success so environment terminates
-            return 18.0, ["Already inserted — episode should terminate"]
+            return 18.0, ["Already inserted — episode should terminate"], self.get_normalized_score()
 
         reward: float  = 0.0
         log: List[str] = []
+        safety_violations = 0
 
         for ac in self.traffic:
             lateral  = math.hypot(self.emergency.lat - ac.lat,
@@ -287,6 +299,7 @@ class EmergencyVectorEnv:
 
             if lateral < 3.0 and vertical < 1000:
                 reward -= 22
+                safety_violations += 1
                 log.append(
                     f"SAFETY VIOLATION: {self.emergency.callsign} vs {ac.callsign} "
                     f"lat={lateral:.2f}NM vert={vertical:.0f}ft")
@@ -317,43 +330,32 @@ class EmergencyVectorEnv:
         self.emergency.heading  = heading
         self.emergency.altitude = altitude
 
-        conflict_free = not any("SAFETY VIOLATION" in l for l in log)
+        conflict_free = safety_violations == 0
         if conflict_free:
             self.inserted = True
             log.append("INSERTION CONFIRMED — terminal")
+        
+        normalized_score = self.get_normalized_score()
+        log.append(f"score={normalized_score:.4f}")
 
-        # Summary metrics for the header line
-        dist_nm   = math.hypot(
-            self.emergency.lat - (sum(a.lat for a in self.traffic) / max(1, len(self.traffic))),
-            self.emergency.lon - (sum(a.lon for a in self.traffic) / max(1, len(self.traffic))),
-        )
-        runway_heading = 180.0
-        hdg_error = abs(heading - runway_heading) % 360
-        hdg_error = min(hdg_error, 360 - hdg_error)
-
-        log.insert(0,
-            f"Vector heading={heading:.0f}° alt={altitude:.0f}ft "
-            f"dist={dist_nm:.1f}NM hdg_err={hdg_error:.0f}° "
-            f"reward={reward:.1f}")
-        return round(reward, 2), log
+        return round(reward, 2), log, normalized_score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TASK 4 — CONFLICT ALERT  (improved)
+# TASK 4 — CONFLICT ALERT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ConflictAircraftState:
     callsign:    str
-    x:           float   # NM east
-    y:           float   # NM north
+    x:           float
+    y:           float
     speed_kts:   float
     heading_deg: float = 90.0
-    target_hdg:  float = 90.0   # desired final heading (degrees)
-    altitude:    float = 8000.0  # feet MSL — kept for environment.py compatibility
+    target_hdg:  float = 90.0
+    altitude:    float = 8000.0
 
     def tick(self, dt_min: float = 1.0):
-        """Advance position by dt_min minutes along current heading/speed."""
         nm   = self.speed_kts / 60.0 * dt_min
         rad  = math.radians(self.heading_deg)
         self.x += nm * math.sin(rad)
@@ -364,24 +366,42 @@ class ConflictAircraftState:
 class ConflictAlertEnv:
     ac1:          ConflictAircraftState
     ac2:          ConflictAircraftState
-    safe_seconds: int = 0   # consecutive steps both aircraft have been safe
+    safe_seconds: int = 0
 
     def _separation(self) -> float:
         return math.hypot(self.ac1.x - self.ac2.x, self.ac1.y - self.ac2.y)
 
     @staticmethod
     def _heading_deviation(ac: ConflictAircraftState) -> float:
-        """Smallest angular distance from current heading to target heading."""
         diff = abs(ac.heading_deg - ac.target_hdg) % 360
         return min(diff, 360 - diff)
+    
+    def get_normalized_score(self) -> float:
+        """Calculate normalized score for conflict resolution."""
+        sep = self._separation()
+        dev1 = self._heading_deviation(self.ac1)
+        dev2 = self._heading_deviation(self.ac2)
+        
+        # Separation score
+        if sep > 8.0:
+            sep_score = 0.95
+        elif sep > 5.0:
+            sep_score = 0.7 + (sep - 5.0) / 3.0 * 0.25
+        elif sep > 3.0:
+            sep_score = 0.3 + (sep - 3.0) / 2.0 * 0.4
+        else:
+            sep_score = max(0.05, sep / 3.0 * 0.3)
+        
+        # Heading deviation penalty
+        heading_penalty = (dev1 + dev2) / 360.0 * 0.2
+        
+        final_score = max(0.05, min(0.95, sep_score - heading_penalty))
+        return round(final_score, 4)
 
-    def step(self, action: str) -> Tuple[float, str, float]:
+    def step(self, action: str) -> Tuple[float, str, float, float, float]:
         """
-        Apply action, score current (pre-tick) separation, then tick both aircraft.
-
-        Returns (reward, description, pre_tick_horiz_sep, pre_tick_vert_sep).
-        Scoring on pre-tick positions means step 1 always evaluates spawn positions
-        (guaranteed safe) rather than post-movement positions.
+        Apply action, score current separation, then tick both aircraft.
+        Returns (reward, description, pre_tick_horiz_sep, pre_tick_vert_sep, normalized_score).
         """
         reward      = 0.0
         log_parts: List[str] = []
@@ -392,36 +412,28 @@ class ConflictAlertEnv:
         if action == "left_10":
             self.ac1.heading_deg = (self.ac1.heading_deg - 10) % 360
             log_parts.append("AC1 turn left 10°")
-
         elif action == "right_10":
             self.ac1.heading_deg = (self.ac1.heading_deg + 10) % 360
             log_parts.append("AC1 turn right 10°")
-
         elif action == "slow_10":
             self.ac1.speed_kts = max(100, self.ac1.speed_kts - 10)
             log_parts.append(f"AC1 slow 10kts → {self.ac1.speed_kts:.0f}kts")
-
         elif action == "speed_10":
             self.ac1.speed_kts = min(350, self.ac1.speed_kts + 10)
             log_parts.append(f"AC1 accelerate 10kts → {self.ac1.speed_kts:.0f}kts")
-
         elif action == "ac2_left_10":
             self.ac2.heading_deg = (self.ac2.heading_deg - 10) % 360
             log_parts.append("AC2 turn left 10°")
-
         elif action == "ac2_right_10":
             self.ac2.heading_deg = (self.ac2.heading_deg + 10) % 360
             log_parts.append("AC2 turn right 10°")
-
         elif action == "ac2_slow_10":
             self.ac2.speed_kts = max(100, self.ac2.speed_kts - 10)
             log_parts.append(f"AC2 slow 10kts → {self.ac2.speed_kts:.0f}kts")
-
         elif action == "ac2_speed_10":
             self.ac2.speed_kts = min(350, self.ac2.speed_kts + 10)
             log_parts.append(f"AC2 accelerate 10kts → {self.ac2.speed_kts:.0f}kts")
 
-        # Score on PRE-tick positions (current separation before movement)
         horiz_sep = self._separation()
         vert_sep  = abs(self.ac1.altitude - self.ac2.altitude)
 
@@ -430,74 +442,52 @@ class ConflictAlertEnv:
         if vert_sep >= 1000:
             reward += 10
         if horiz_sep > 5.0 and vert_sep >= 1000:
-            reward += 15   # hybrid bonus
+            reward += 15
 
         if horiz_sep < 3.0 and vert_sep < 1000:
             reward -= 25
 
-        # Tick AFTER scoring — positions advance ready for the next step
         self.ac1.tick(dt_min=1.0)
         self.ac2.tick(dt_min=1.0)
 
         sep_after = self._separation()
-
-        # ── Evaluate POST-tick separation (action effect is now visible) ───────
         dev1      = self._heading_deviation(self.ac1)
         dev2      = self._heading_deviation(self.ac2)
         on_course = dev1 <= 20.0 and dev2 <= 20.0
 
-        # +10: safely apart AND on-course
         if sep_after > 8.0 and on_course:
             reward           += 10
             self.safe_seconds += 1
-            log_parts.append(
-                f"+10 safely apart ({sep_after:.2f}NM) and on-course"
-            )
+            log_parts.append(f"+10 safely apart ({sep_after:.2f}NM) and on-course")
         elif sep_after > 8.0:
-            # Safe distance but off-course — partial credit, reset streak
             reward            += 5
             self.safe_seconds += 1
-            log_parts.append(
-                f"+5 safe distance ({sep_after:.2f}NM) but off-course "
-                f"(dev1={dev1:.0f}° dev2={dev2:.0f}°)"
-            )
+            log_parts.append(f"+5 safe distance ({sep_after:.2f}NM) but off-course")
         else:
-            # Not yet safe — reset streak
             self.safe_seconds = 0
 
-        # +2 per accumulated safe second
         if self.safe_seconds > 0:
             safe_bonus = self.safe_seconds * 2
             reward    += safe_bonus
-            log_parts.append(
-                f"+{safe_bonus} safe-time bonus ({self.safe_seconds}s streak)"
-            )
+            log_parts.append(f"+{safe_bonus} safe-time bonus ({self.safe_seconds}s streak)")
 
-        # -5: separation got worse
         if sep_after < sep_before:
             reward    -= 5
-            log_parts.append(
-                f"-5 sep decreased ({sep_before:.2f}→{sep_after:.2f}NM)"
-            )
+            log_parts.append(f"-5 sep decreased ({sep_before:.2f}→{sep_after:.2f}NM)")
 
-        # -15: critical proximity
         if sep_after < 5.0:
             reward    -= 15
-            log_parts.append(
-                f"-15 CRITICAL PROXIMITY ({sep_after:.2f}NM < 5NM)"
-            )
+            log_parts.append(f"-15 CRITICAL PROXIMITY ({sep_after:.2f}NM < 5NM)")
 
+        normalized_score = self.get_normalized_score()
+        log_parts.append(f"score={normalized_score:.4f}")
+        
         description = " | ".join(log_parts)
-        description += f" | sep={sep_after:.2f}NM reward={reward:.1f}"
-        # Return 4 values: (reward, description, horiz_sep, vert_sep)
-        # vert_sep derived from altitude difference (always 0 if altitudes equal).
-        # environment.py unpacks: raw_reward, desc, sep, vert_sep
-        vert_sep = abs(self.ac1.altitude - self.ac2.altitude)
-        return round(reward, 2), description, sep_after, vert_sep
+        return round(reward, 2), description, horiz_sep, vert_sep, normalized_score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TASK 5 — GATE ASSIGNMENT  (improved)
+# TASK 5 — GATE ASSIGNMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -510,15 +500,13 @@ class Gate:
 
     @property
     def blocked(self) -> bool:
-        # FIX: occupied gates are NOT also flagged as blocked — the occupied
-        # penalty already covers them. Double-penalising skewed agent gate choice.
         return (not self.occupied) and (self.blocked_by is not None)
 
 
 @dataclass
 class ArrivingPlane:
     callsign: str
-    eta_min:  float   # minutes until touchdown
+    eta_min:  float
 
 
 @dataclass
@@ -527,6 +515,36 @@ class GateAssignmentEnv:
     gates:       List[Gate]
     queue:       List[ArrivingPlane]   = field(default_factory=list)
     assignments: List[Dict[str, Any]]  = field(default_factory=list)
+    
+    def get_normalized_score(self) -> float:
+        """Calculate normalized score for gate assignment."""
+        if not self.assignments:
+            return 0.5
+        
+        valid_assignments = sum(1 for a in self.assignments if a.get("valid", False))
+        total_assignments = len(self.assignments)
+        
+        if total_assignments == 0:
+            return 0.5
+        
+        success_rate = valid_assignments / total_assignments
+        
+        # Calculate average taxi time for valid assignments
+        taxi_times = []
+        for i, a in enumerate(self.assignments):
+            if a.get("valid", False):
+                gate_id = a.get("gate_id")
+                gate = next((g for g in self.gates if g.gate_id == gate_id), None)
+                if gate:
+                    taxi_times.append(gate.taxi_dist_min)
+        
+        avg_taxi = sum(taxi_times) / len(taxi_times) if taxi_times else 15.0
+        taxi_score = max(0.0, 1.0 - avg_taxi / 20.0)
+        
+        # Combine scores
+        final_score = (success_rate * 0.6) + (taxi_score * 0.4)
+        final_score = max(0.05, min(0.95, final_score))
+        return round(final_score, 4)
 
     @property
     def queue_empty(self) -> bool:
@@ -540,22 +558,10 @@ class GateAssignmentEnv:
         return None
 
     def _gate_score(self, gate: Gate, eta: float) -> float:
-        """
-        Scoring function used by find_best_gate — mirrors the assign() reward
-        so greedy selection always picks the gate that maximises actual reward.
-
-        Score components (positive = better):
-          +15  quick arrival AND short taxi
-          +5   short taxi (≤ 5 min)
-          -8   long taxi (> 10 min) OR long ETA (> 15 min)
-          -20  blocked path
-          -20  incompatible
-          -30  occupied
-        """
         score = 0.0
         if gate.occupied:
             score -= 30
-            return score      # occupied gate — further scoring irrelevant
+            return score
         if not gate.compatible:
             score -= 20
         if gate.blocked:
@@ -574,31 +580,24 @@ class GateAssignmentEnv:
         return score
 
     def find_best_gate(self) -> str:
-        """Unoccupied, unblocked, compatible gate with shortest taxi."""
-        # Tier 1: free, unblocked, compatible
         candidates = [
             g for g in self.gates
             if not g.occupied and not g.blocked and g.compatible
         ]
         if candidates:
             return min(candidates, key=lambda g: g.taxi_dist_min).gate_id
-        # Tier 2: free, unblocked (any compatibility)
         free = [g for g in self.gates if not g.occupied and not g.blocked]
         if free:
             return min(free, key=lambda g: g.taxi_dist_min).gate_id
-        # Tier 3: free but blocked (still better than occupied)
         free_blocked = [g for g in self.gates if not g.occupied]
         if free_blocked:
             return min(free_blocked, key=lambda g: g.taxi_dist_min).gate_id
-        # Tier 4: all gates occupied — pick shortest taxi to minimise penalty
         return min(self.gates, key=lambda g: g.taxi_dist_min).gate_id
 
-    def assign(self, gate_id: str) -> Tuple[float, List[str]]:
+    def assign(self, gate_id: str) -> Tuple[float, List[str], float]:
         """
-        Assign *arriving* to *gate_id*.  Returns (reward, log_lines).
-
-        FIX: queue advances after every call (valid or invalid) so the queue
-        always drains and queue_empty becomes True at the right time.
+        Assign *arriving* to *gate_id*.
+        Returns (reward, log_lines, normalized_score).
         """
         gate   = next((g for g in self.gates if g.gate_id == gate_id), None)
         log:   List[str] = []
@@ -613,9 +612,8 @@ class GateAssignmentEnv:
                  "reward":   0.0}
             )
         else:
-            valid = True   # assume valid until a hard constraint fires
+            valid = True
 
-            # ── Hard constraints (stackable penalties) ────────────────────────
             if gate.occupied:
                 reward -= 30
                 valid   = False
@@ -631,9 +629,7 @@ class GateAssignmentEnv:
                 valid   = False
                 log.append(f"  -20  Gate {gate_id} taxi path BLOCKED by {gate.blocked_by}")
 
-            # ── Soft rewards/penalties (only for valid gates) ─────────────────
             if valid:
-                # Short taxi bonus
                 if gate.taxi_dist_min <= 5.0:
                     reward += 5
                     log.append(f"  +5   Short taxi {gate.taxi_dist_min:.1f}min")
@@ -641,30 +637,18 @@ class GateAssignmentEnv:
                     reward -= 8
                     log.append(f"  -8   Long taxi {gate.taxi_dist_min:.1f}min (detour)")
 
-                # Quick arrival + close gate bonus
                 if self.arriving.eta_min <= 12.0 and gate.taxi_dist_min <= 7.0:
                     reward += 15
-                    log.append(
-                        f"  +15  Quick arrival "
-                        f"(ETA={self.arriving.eta_min:.1f}min, "
-                        f"taxi={gate.taxi_dist_min:.1f}min)"
-                    )
+                    log.append(f"  +15  Quick arrival (ETA={self.arriving.eta_min:.1f}min, taxi={gate.taxi_dist_min:.1f}min)")
                 elif self.arriving.eta_min > 15.0:
                     reward -= 8
-                    log.append(
-                        f"  -8   Long ETA {self.arriving.eta_min:.1f}min → plane must wait"
-                    )
+                    log.append(f"  -8   Long ETA {self.arriving.eta_min:.1f}min → plane must wait")
 
-                # Mark gate occupied
                 gate.occupied   = True
                 gate.blocked_by = self.arriving.callsign
-                log.append(
-                    f"  Gate {gate_id} assigned to {self.arriving.callsign}"
-                )
+                log.append(f"  Gate {gate_id} assigned to {self.arriving.callsign}")
             else:
-                log.append(
-                    f"  Gate {gate_id} rejected — no soft rewards applied"
-                )
+                log.append(f"  Gate {gate_id} rejected — no soft rewards applied")
 
             self.assignments.append(
                 {"callsign": self.arriving.callsign,
@@ -673,13 +657,13 @@ class GateAssignmentEnv:
                  "reward":   round(reward, 2)}
             )
 
-        # FIX: always advance queue regardless of assignment validity
         if self.queue:
             self.arriving = self.queue.pop(0)
-            log.append(
-                f"  Next: {self.arriving.callsign}  ETA {self.arriving.eta_min:.1f}min"
-            )
+            log.append(f"  Next: {self.arriving.callsign}  ETA {self.arriving.eta_min:.1f}min")
         else:
             log.append("  Queue exhausted — all planes processed")
+        
+        normalized_score = self.get_normalized_score()
+        log.append(f"score={normalized_score:.4f}")
 
-        return round(reward, 2), log
+        return round(reward, 2), log, normalized_score
