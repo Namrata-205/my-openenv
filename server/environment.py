@@ -268,9 +268,10 @@ class ATCEnvironment:
         sep_ratio  = self._wake_env.current_sep / self._wake_env.required_sep
         max_buffer = 2.0
         buffer     = max(0.0, min(sep_ratio - 1.0, max_buffer))
-        score      = ((0.7 + 0.3 * (buffer / max_buffer))
+        score      = self._strict_score(
+                      (0.7 + 0.3 * (buffer / max_buffer))
                       if not violated
-                      else max(0.0, sep_ratio * 0.7))
+                      else (sep_ratio * 0.7))
 
         # Terminal: achieved good separation (≥ required + 0.5 NM) for 3 steps
         # without violation, OR exceeded max delay (episode is unrecoverable)
@@ -311,7 +312,7 @@ class ATCEnvironment:
         violations     = [f"GO-AROUND: {cs}" for cs in go_arounds]
 
         landed_count = stats["landed"]
-        score        = round(landed_count / max(1, n), 4)
+        score        = self._strict_score(landed_count / max(1, n))
 
         all_resolved = all(f.landed or f.went_around for f in self._flights)
         info = {
@@ -340,7 +341,7 @@ class ATCEnvironment:
 
         conflict_count = len(violations)
         time_penalty   = max(0, insert_time - 2) * 0.1
-        score          = max(0.0, 1.0 - conflict_count * 0.33 - time_penalty)
+        score          = self._strict_score(1.0 - conflict_count * 0.33 - time_penalty)
 
         # Terminal: grader confirmed insertion, OR conflict-free within time window,
         # OR too many conflicts (unrecoverable). Always terminates after insertion.
@@ -375,7 +376,7 @@ class ATCEnvironment:
         violations = ([f"CRITICAL PROXIMITY: {sep:.2f} NM"]
                       if sep < 5.0 and vert_sep < 1000 else [])
 
-        score = min(1.0, sep / 8.0)
+        score = self._strict_score(sep / 12.0)
 
         info = {
             "raw_reward":  raw_reward,
@@ -410,9 +411,9 @@ class ATCEnvironment:
         # Score: 1.0 for perfect (valid + compatible), 0.5 for valid but incompatible, 0.0 for occupied/blocked
         gate_obj = next((g for g in self._gate_env.gates if g.gate_id == gate_id), None)
         if last.get("valid"):
-            score = 1.0 if (gate_obj and gate_obj.compatible) else 0.5
+            score = self._strict_score(0.95 if (gate_obj and gate_obj.compatible) else 0.5)
         else:
-            score = 0.0
+            score = self._strict_score(0.05)
 
         queue_done = self._gate_env.queue_empty
         info = {
@@ -552,6 +553,15 @@ class ATCEnvironment:
         if high == low:
             return 0.5
         return max(0.0, min(1.0, (value - low) / (high - low)))
+
+    @staticmethod
+    def _strict_score(value: float) -> float:
+        """
+        Clamp score to the open interval (0.0, 1.0) — strictly exclusive.
+        Validator rejects scores that are exactly 0.0 or 1.0.
+          0.0  -> 0.01  |  1.0  -> 0.99  |  anything between -> unchanged
+        """
+        return round(max(0.01, min(0.99, value)), 4)
 
     def _get_state(self) -> EnvironmentState:
         return EnvironmentState(
