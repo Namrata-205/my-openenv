@@ -1,16 +1,5 @@
 """
 graders.py — Task graders for the ATC TRACON RL Environment.
-
-Validator requirements:
-  - At least 3 tasks must have a grade() method.
-  - grade() must return a float STRICTLY between 0 and 1 (exclusive).
-
-Each env now exposes:
-  grade(actions) -> float  in (0.0001, 0.9999)
-
-Normalization approach per task:
-  score = (raw_reward - min_possible) / (max_possible - min_possible)
-  score = clamp(score, 0.0001, 0.9999)
 """
 
 from __future__ import annotations
@@ -23,7 +12,7 @@ from enum import Enum
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SHARED NORMALISATION HELPER
+# SHARED NORMALISATION HELPER - FIXED to NEVER return 0.0 or 1.0
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _normalise(raw: float, lo: float, hi: float) -> float:
@@ -34,6 +23,12 @@ def _normalise(raw: float, lo: float, hi: float) -> float:
     if hi == lo:
         return 0.5
     score = (raw - lo) / (hi - lo)
+    # CRITICAL FIX: Ensure score is NEVER exactly 0.0 or 1.0
+    if score <= 0.0:
+        return 0.0001
+    if score >= 1.0:
+        return 0.9999
+    # Also clamp to ensure nothing slips through
     return max(0.0001, min(0.9999, score))
 
 
@@ -55,9 +50,6 @@ REQUIRED_SEPARATION: Dict[Tuple[AircraftCategory, AircraftCategory], float] = {
     (AircraftCategory.LIGHT,  AircraftCategory.LIGHT):  3.0,
 }
 
-# Reward range for WakeTurbulenceEnv.step():
-#   best possible:  +12 (perfect spacing, no delay penalty)
-#   worst possible: -25 (loss of separation + delay penalty)
 _WAKE_MIN = -25.0
 _WAKE_MAX =  12.0
 
@@ -122,10 +114,7 @@ class WakeTurbulenceEnv:
         return round(reward, 2), " | ".join(log_parts)
 
     def grade(self, action: str = "slow_down_trailing") -> float:
-        """
-        Run one step and return a normalised score strictly in (0, 1).
-        Saves the episode state so callers can also read .current_sep etc.
-        """
+        """Run one step and return a normalised score strictly in (0, 1)."""
         raw, _ = self.step(action)
         return _normalise(raw, _WAKE_MIN, _WAKE_MAX)
 
@@ -149,15 +138,7 @@ def sequence_flights(
     flights: List[InboundFlight],
     strategy: str,
 ) -> Tuple[float, List[str], Dict[str, Any]]:
-    """
-    Sequence flights and return (total_reward, events, stats).
-
-    Reward spec:
-      +12  go-around rate < 5%
-      +3   on-time landing (wait ≤ 1 min)
-      -20  each go-around
-      -8 × ceil(wait_min)  holding penalty per flight
-    """
+    """Sequence flights and return (total_reward, events, stats)."""
 
     if strategy == "fcfs":
         flights.sort(key=lambda f: f.eta_min)
@@ -238,18 +219,12 @@ def sequence_flights(
     return round(total_reward, 2), events, stats
 
 
-# Reward bounds for sequence_flights with N flights:
-#   best:  +12 bonus + N×3 on-time = 12 + 5×3 = 27   (assume ≤ 5 flights)
-#   worst: N×(-20) go-arounds      = 5×(-20) = -100
 _SEQ_MIN = -100.0
 _SEQ_MAX =   27.0
 
 
 class GoAroundGrader:
-    """
-    Wraps sequence_flights so the validator can call .grade() on it.
-    Instantiate with a list of InboundFlight objects and a strategy name.
-    """
+    """Wraps sequence_flights so the validator can call .grade() on it."""
 
     def __init__(self, flights: List[InboundFlight], strategy: str = "rl_agent"):
         self.flights  = flights
@@ -257,7 +232,6 @@ class GoAroundGrader:
 
     def grade(self) -> float:
         """Return a normalised score strictly in (0, 1)."""
-        # Copy flights so repeated calls don't accumulate state
         import copy
         flights_copy = copy.deepcopy(self.flights)
         raw, _, _    = sequence_flights(flights_copy, self.strategy)
@@ -279,9 +253,6 @@ class Aircraft:
     fuel_state: float = 1.0
 
 
-# Reward bounds for EmergencyVectorEnv.insert_emergency():
-#   best:  alignment_bonus(10) + time_bonus(2) + 5×clear(5) × urgency(2) ≈ 62
-#   worst: -22×traffic_count × urgency(2) ≈ -88  (4 traffic × -22 × 2)
 _EMG_MIN = -88.0
 _EMG_MAX =  62.0
 
@@ -387,10 +358,6 @@ class ConflictAircraftState:
         self.y += nm * math.cos(rad)
 
 
-# Reward bounds per step for ConflictAlertEnv.step():
-#   best:  +10(horiz) +10(vert) +15(hybrid) +10(safe+on-course) + streak_bonus - no penalties
-#          ≈ 45 + streak  →  cap at 60 per step to be safe
-#   worst: -25(critical) -15(proximity) -5(sep_worse) = -45
 _CONFLICT_MIN = -45.0
 _CONFLICT_MAX =  60.0
 
@@ -470,8 +437,7 @@ class ConflictAlertEnv:
             self.safe_seconds += 1
             log_parts.append(
                 f"+5 safe distance ({sep_after:.2f}NM) but off-course "
-                f"(dev1={dev1:.0f}° dev2={dev2:.0f}°)"
-            )
+                f"(dev1={dev1:.0f}° dev2={dev2:.0f}°)")
         else:
             self.safe_seconds = 0
 
@@ -522,9 +488,6 @@ class ArrivingPlane:
     eta_min:  float
 
 
-# Reward bounds for GateAssignmentEnv.assign():
-#   best:  +5(short taxi) +15(quick arrival) = +20
-#   worst: -30(occupied) -20(incompatible) -20(blocked) = -70
 _GATE_MIN = -70.0
 _GATE_MAX =  20.0
 
@@ -655,10 +618,7 @@ class GateAssignmentEnv:
         return round(reward, 2), log
 
     def grade(self, gate_id: Optional[str] = None) -> float:
-        """
-        Assign arriving aircraft to gate_id (or auto-pick best gate) and
-        return a normalised score strictly in (0, 1).
-        """
+        """Assign arriving aircraft and return a normalised score strictly in (0, 1)."""
         chosen = gate_id if gate_id is not None else self.find_best_gate()
         raw, _ = self.assign(chosen)
         return _normalise(raw, _GATE_MIN, _GATE_MAX)
