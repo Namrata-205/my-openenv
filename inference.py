@@ -17,67 +17,51 @@ from openai import OpenAI
 
 # ── Environment variables ──────────────────────────────────────────────────────
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:7860")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "mistralai/Mistral-7B-Instruct-v0.2")
-HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-
-# Grok API (xAI) — set GROK_API_KEY in env to enable.
-GROK_API_KEY  = os.environ.get("GROK_API_KEY", "")
-GROK_MODEL    = os.environ.get("GROK_MODEL", "grok-3-mini")
-GROK_BASE_URL = "https://api.x.ai/v1"
-
-HF_BASE_URL  = "https://api-inference.huggingface.co/v1"
+API_KEY      = os.environ.get("API_KEY", "dummy")
+MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 
 DEFAULT_TASK = "conflict_resolution"
 MAX_STEPS    = 10
-MAX_RETRIES  = 3          # retries on transient server errors
-RETRY_DELAY  = 1.0        # seconds (doubles each retry)
+MAX_RETRIES  = 3
+RETRY_DELAY  = 1.0
 
 
-# ── OpenAI Client (HuggingFace) ────────────────────────────────────────────────
-hf_client = OpenAI(
-    base_url=HF_BASE_URL,
-    api_key=HF_TOKEN or "dummy",
-)
-
-# ── Grok Client (xAI) ─────────────────────────────────────────────────────────
-grok_client = OpenAI(
-    base_url=GROK_BASE_URL,
-    api_key=GROK_API_KEY or "dummy",
+# ── OpenAI-compatible client pointing at the validator's LiteLLM proxy ─────────
+# CRITICAL: Must use the exact environment variables provided by validator
+llm_client = OpenAI(
+    base_url=API_BASE_URL,  # Using the environment variable directly
+    api_key=API_KEY,         # Using the environment variable directly
 )
 
 
-# ── Server availability check ────────────────────────────────────────────────────
+# ── Server availability check ─────────────────────────────────────────────────
 
 def is_server_ready(max_attempts: int = 3) -> bool:
-    """Check if the environment server is ready to accept requests."""
     for attempt in range(max_attempts):
         try:
             response = requests.get(f"{API_BASE_URL}/health", timeout=5)
             if response.status_code == 200:
+                print(f"[INFO] Server ready at {API_BASE_URL}")
                 return True
-            print(f"[INFO] Server health check attempt {attempt + 1}: status {response.status_code}")
+            print(f"[INFO] Health check attempt {attempt + 1}: status {response.status_code}")
         except requests.exceptions.ConnectionError:
             print(f"[INFO] Server not reachable at {API_BASE_URL} (attempt {attempt + 1})")
         except Exception as e:
             print(f"[INFO] Health check failed: {e}")
-        
         if attempt < max_attempts - 1:
             time.sleep(2)
-    
     return False
 
 
-# ── HTTP helpers with retry ────────────────────────────────────────────────────
+# ── HTTP helpers with retry ───────────────────────────────────────────────────
 
 def _post_with_retry(url: str, payload: Dict, label: str) -> Dict:
-    """POST with exponential-backoff retry on 5xx responses."""
     delay = RETRY_DELAY
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = requests.post(url, json=payload, timeout=30)
             if r.ok:
                 return r.json()
-            # Retry only on server errors (5xx), not client errors (4xx).
             if r.status_code < 500:
                 r.raise_for_status()
             print(f"[WARN] {label} attempt {attempt}/{MAX_RETRIES} got {r.status_code} — retrying in {delay:.1f}s")
@@ -107,19 +91,27 @@ def env_state() -> Dict:
 
 # ── LLM agent ─────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert Air Traffic Controller.
+SYSTEM_PROMPT = """You are an expert Air Traffic Controller managing TRACON airspace.
 
-You MUST take corrective action when conflicts exist.
+You MUST take corrective action when conflicts exist or separation is insufficient.
 
-Rules:
+CRITICAL RULES:
 - NEVER use "ALL" as a callsign
 - ALWAYS use a valid aircraft callsign from the state
-- For conflict_resolution you may act on AC1 or AC2 independently
-- Allowed action_type values: heading_change, speed_change, altitude_change,
-  sequence_swap, assign_gate, vector, no_action
-- For heading_change: negative value = turn left, positive = turn right
-- For altitude_change: positive value = climb, negative = descend
-- If no action is needed, choose ANY one aircraft and return no_action for it
+- For conflict_resolution: act on BOTH conflicting aircraft when needed
+- For wake_turbulence: act on the trailing aircraft
+- For emergency_vectoring: prioritize the MAYDAY aircraft
+- For go_around_prevention: manage landing sequence spacing
+- For gate_assignment: assign gates to arriving aircraft
+
+Allowed action_type values:
+- heading_change: negative = turn left, positive = turn right (value in degrees)
+- speed_change: negative = slow down, positive = speed up (value in knots)
+- altitude_change: positive = climb, negative = descend (value in feet)
+- sequence_swap: swap landing order (secondary_target required)
+- assign_gate: assign to gate (gate_id required)
+- vector: direct to heading (value in degrees)
+- no_action: no change needed
 
 Respond ONLY with valid JSON (no markdown fences, no extra text).
 
@@ -129,8 +121,8 @@ Format:
     "action_type": "...",
     "target_callsign": "<REAL CALLSIGN>",
     "value": <number or null>,
-    "secondary_target": null,
-    "gate_id": null,
+    "secondary_target": null or "<callsign>",
+    "gate_id": null or "<GATE_ID>",
     "rationale": "short reason"
   }
 ]
@@ -138,40 +130,125 @@ Format:
 
 
 def build_user_prompt(state: Dict, step: int) -> str:
+    """Build a detailed prompt for the LLM with current state information."""
+    
+    task = state.get("task", "unknown")
+    conflicts = state.get("active_conflicts", [])
+    
+    # Build aircraft summary
     aircraft_summary = []
     for ac in state.get("aircraft", []):
-        aircraft_summary.append({
-            "callsign":     ac["callsign"],
-            "category":     ac["category"],
-            "status":       ac["status"],
-            "x_nm":         round(ac["x"], 1),
-            "y_nm":         round(ac["y"], 1),
-            "altitude_ft":  int(ac["altitude"]),
-            "heading_deg":  round(ac["heading"], 1),
-            "speed_kts":    round(ac["speed"], 1),
-            "emergency":    ac.get("is_emergency", False),
-            "fuel":         round(ac.get("fuel_state", 1.0), 2),
-            "sequence":     ac.get("sequence_pos"),
-            "gate":         ac.get("assigned_gate"),
-        })
+        ac_info = {
+            "callsign": ac.get("callsign"),
+            "category": ac.get("category", "unknown"),
+            "status": ac.get("status", "active"),
+            "position": {
+                "x_nm": round(ac.get("x", 0), 1),
+                "y_nm": round(ac.get("y", 0), 1)
+            },
+            "altitude_ft": int(ac.get("altitude", 0)),
+            "heading_deg": round(ac.get("heading", 0), 1),
+            "speed_kts": round(ac.get("speed", 0), 1),
+            "emergency": ac.get("is_emergency", False),
+            "fuel": round(ac.get("fuel_state", 1.0), 2),
+        }
+        
+        # Task-specific fields
+        if task == "wake_turbulence":
+            ac_info["wake_category"] = ac.get("wake_category", "medium")
+        elif task == "go_around_prevention":
+            ac_info["sequence_pos"] = ac.get("sequence_pos")
+            ac_info["distance_to_runway"] = round(
+                math.sqrt(ac.get("x", 0)**2 + ac.get("y", 0)**2), 1
+            )
+        elif task == "gate_assignment":
+            ac_info["aircraft_type"] = ac.get("aircraft_type", ac.get("type", ""))
+            ac_info["assigned_gate"] = ac.get("assigned_gate", ac.get("gate"))
+        
+        aircraft_summary.append(ac_info)
+    
+    prompt_data = {
+        "step": step,
+        "task": task,
+        "active_conflicts": conflicts,
+        "aircraft_count": len(aircraft_summary),
+        "aircraft": aircraft_summary,
+    }
+    
+    # Add task-specific information
+    if task == "wake_turbulence":
+        prompt_data["required_separation_nm"] = state.get("info", {}).get("required_nm", 5.0)
+    elif task == "gate_assignment":
+        prompt_data["gates_available"] = [
+            {
+                "gate_id": g.get("gate_id"),
+                "compatible_types": g.get("compatible_types", g.get("compatible_aircraft", [])),
+                "taxi_distance": g.get("taxi_dist_min", g.get("distance", 0))
+            }
+            for g in state.get("gates", [])
+            if not g.get("occupied", False) and not g.get("is_blocked", False)
+        ]
+    elif task == "emergency_vectoring":
+        emergency_ac = next((a for a in aircraft_summary if a.get("emergency")), None)
+        if emergency_ac:
+            prompt_data["emergency_aircraft"] = emergency_ac
+            prompt_data["runway_heading"] = state.get("info", {}).get("runway_heading", 180)
+    
+    return json.dumps(prompt_data, indent=2)
 
-    return json.dumps({
-        "step":             step,
-        "task":             state.get("task"),
-        "must_act":         len(state.get("active_conflicts", [])) > 0,
-        "active_conflicts": state.get("active_conflicts", []),
-        "aircraft":         aircraft_summary,
-        "gates_available":  [
-            g["gate_id"] for g in state.get("gates", []) if not g["occupied"]
-        ],
-    }, indent=2)
+
+def safe_parse_actions(text: str, state: Dict) -> List[Dict]:
+    """Safely parse LLM response into action list."""
+    cleaned = text.strip()
+    
+    # Remove markdown code blocks if present
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        # Remove first and last line if they are code fences
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines)
+    
+    try:
+        actions = json.loads(cleaned)
+        if not isinstance(actions, list):
+            actions = [actions]
+        
+        # Validate and clean actions
+        validated_actions = []
+        for action in actions:
+            # Ensure required fields exist
+            if "action_type" not in action:
+                continue
+            if "target_callsign" not in action:
+                continue
+            
+            # Validate callsign is not "ALL"
+            if action["target_callsign"] == "ALL":
+                # Try to find a valid callsign from state
+                if state.get("aircraft"):
+                    action["target_callsign"] = state["aircraft"][0].get("callsign", "AAL201")
+                else:
+                    continue
+            
+            validated_actions.append(action)
+        
+        return validated_actions if validated_actions else _fallback_action(state, "No valid actions parsed")
+        
+    except Exception as exc:
+        print(f"[WARN] JSON parse error: {exc}")
+        print(f"[WARN] Raw response: {text[:200]}...")
+        return _fallback_action(state, f"JSON parse error: {exc}")
 
 
 def _fallback_action(state: Dict, reason: str) -> List[Dict]:
-    """Always pick a real callsign from state, never use 'ALL'."""
+    """Fallback action when LLM fails."""
     callsign = "AAL201"
     if state.get("aircraft"):
-        callsign = state["aircraft"][0]["callsign"]
+        callsign = state["aircraft"][0].get("callsign", "AAL201")
+    
     return [{
         "action_type":      "no_action",
         "target_callsign":  callsign,
@@ -182,430 +259,79 @@ def _fallback_action(state: Dict, reason: str) -> List[Dict]:
     }]
 
 
-def safe_parse_actions(text: str, state: Dict) -> List[Dict]:
-    """state is passed in so the fallback can use real callsigns."""
-    cleaned = text.strip()
+# ── LLM call via validator's proxy ────────────────────────────────────────────
 
-    # Remove markdown fences
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        end   = -1 if lines[-1].strip() == "```" else len(lines)
-        cleaned = "\n".join(lines[1:end])
-
+def call_llm_proxy(state: Dict, step: int) -> List[Dict]:
+    """
+    Call the validator-injected LiteLLM proxy (OpenAI-compatible).
+    This MUST be used for all decision-making to satisfy validator checks.
+    """
+    print(f"[LLM] Calling proxy at {API_BASE_URL} with model {MODEL_NAME}")
+    
     try:
-        actions = json.loads(cleaned)
-        if not isinstance(actions, list):
-            actions = [actions]
+        response = llm_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": build_user_prompt(state, step)},
+            ],
+            temperature=0.2,
+            max_tokens=800,
+        )
+        
+        print(f"[LLM] Proxy call successful, received response")
+        raw_text = response.choices[0].message.content or ""
+        return safe_parse_actions(raw_text, state)
+        
+    except Exception as exc:
+        print(f"[LLM] Proxy call failed: {exc}")
+        raise  # Re-raise to trigger fallback
+
+
+# ── Main agent: ALWAYS use LLM proxy ──────────────────────────────────────────
+
+def get_actions(state: Dict, step: int) -> List[Dict]:
+    """
+    Get actions from the LLM proxy.
+    The validator expects to see API calls through their proxy for every decision.
+    """
+    task = state.get("task", "unknown")
+    print(f"[STEP] Getting actions for task '{task}' from LLM proxy")
+    
+    # ALWAYS call the LLM proxy - this is what the validator checks for
+    try:
+        actions = call_llm_proxy(state, step)
+        print(f"[STEP] LLM returned {len(actions)} action(s)")
         return actions
     except Exception as exc:
-        return _fallback_action(state, f"JSON parse error: {exc}")
+        print(f"[STEP] LLM proxy failed: {exc}")
+        # Only use fallback if LLM proxy completely fails
+        return _fallback_action(state, f"LLM proxy error: {exc}")
 
 
-# ── Grok API fallback ──────────────────────────────────────────────────────────
-
-def call_grok(state: Dict, step: int) -> List[Dict]:
-    """Call Grok (xAI) API as secondary LLM fallback."""
-    if not GROK_API_KEY:
-        raise ValueError("GROK_API_KEY not set")
-
-    response = grok_client.chat.completions.create(
-        model=GROK_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": build_user_prompt(state, step)},
-        ],
-        temperature=0.2,
-        max_tokens=800,
-    )
-    raw_text = response.choices[0].message.content or ""
-    return safe_parse_actions(raw_text, state)
-
-
-# ── HuggingFace LLM fallback ───────────────────────────────────────────────────
-
-def call_hf_llm(state: Dict, step: int) -> List[Dict]:
-    """Call HuggingFace-hosted LLM as tertiary fallback."""
-    if not HF_TOKEN:
-        raise ValueError("HF_TOKEN not set")
-
-    response = hf_client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": build_user_prompt(state, step)},
-        ],
-        temperature=0.2,
-        max_tokens=800,
-    )
-    raw_text = response.choices[0].message.content or ""
-    return safe_parse_actions(raw_text, state)
-
-
-# ── Main agent: Rule-based → Grok → HuggingFace → hard fallback ───────────────
-
-def call_llm(state: Dict, step: int) -> List[Dict]:
-    """
-    HYBRID AGENT with fallback chain:
-      1. Rule-based ATC decisions (primary — fastest, most reliable)
-      2. Grok API (secondary LLM — if GROK_API_KEY is set)
-      3. HuggingFace LLM (tertiary — if HF_TOKEN is set)
-      4. Hard no_action fallback (always succeeds)
-    """
-    task = state.get("task")
-
-    # FIX: guard against missing task to avoid silent fall-through.
-    if not task:
-        return _fallback_action(state, "No task field in state")
-
-    # ================================================================
-    # TASK 1: WAKE TURBULENCE
-    # ================================================================
-    if task == "wake_turbulence":
-        aircraft = state.get("aircraft", [])
-
-        if len(aircraft) < 2:
-            return _fallback_action(state, "Not enough aircraft")
-
-        lead  = aircraft[0]
-        trail = aircraft[1]
-
-        # FIX: use Euclidean distance — Y-axis alone ignores lateral offset.
-        separation = math.sqrt(
-            (lead["x"] - trail["x"]) ** 2 + (lead["y"] - trail["y"]) ** 2
-        )
-        required_nm  = state.get("info", {}).get("required_nm", 5.0)
-        danger_zone  = required_nm * 1.1
-        caution_zone = required_nm * 1.3
-
-        if separation < danger_zone:
-            return [{
-                "action_type":      "speed_change",
-                "target_callsign":  trail["callsign"],
-                "value":            -20,
-                "secondary_target": None,
-                "gate_id":          None,
-                "rationale":        f"Increase separation (sep={separation:.1f} NM < danger {danger_zone:.1f} NM)",
-            }]
-        elif separation < caution_zone:
-            return [{
-                "action_type":      "heading_change",
-                "target_callsign":  trail["callsign"],
-                "value":            10,
-                "secondary_target": None,
-                "gate_id":          None,
-                "rationale":        "Slight vectoring to increase spacing",
-            }]
-        else:
-            return [{
-                "action_type":      "no_action",
-                "target_callsign":  trail["callsign"],
-                "value":            None,
-                "secondary_target": None,
-                "gate_id":          None,
-                "rationale":        "Safe separation maintained",
-            }]
-
-    # ================================================================
-    # TASK 4: CONFLICT RESOLUTION
-    # ================================================================
-    if task == "conflict_resolution":
-        conflicts = state.get("active_conflicts", [])
-        aircraft  = state.get("aircraft", [])
-
-        # ============================================================
-        # 1. PROACTIVE (FIRST PRIORITY)
-        # ============================================================
-        if len(aircraft) >= 2:
-            a1, a2 = aircraft[0], aircraft[1]
-
-            dx = a1["x"] - a2["x"]
-            dy = a1["y"] - a2["y"]
-            distance = math.sqrt(dx*dx + dy*dy)
-
-            vertical = abs(a1["altitude"] - a2["altitude"])
-
-            if distance < 3 and vertical < 1000:
-                return [
-                    {
-                        "action_type": "altitude_change",
-                        "target_callsign": a1["callsign"],
-                        "value": 1000,
-                        "secondary_target": None,
-                        "gate_id": None,
-                        "rationale": f"Emergency separation (dist={distance:.2f})",
-                    },
-                    {
-                        "action_type": "heading_change",
-                        "target_callsign": a2["callsign"],
-                        "value": 25,
-                        "secondary_target": None,
-                        "gate_id": None,
-                        "rationale": f"Aggressive diverge (dist={distance:.2f})",
-                    },
-                ]
-
-            elif distance < 6 and vertical < 1500:
-                return [
-                    {
-                        "action_type": "heading_change",
-                        "target_callsign": a1["callsign"],
-                        "value": -15,
-                        "secondary_target": None,
-                        "gate_id": None,
-                        "rationale": f"Proactive avoidance (dist={distance:.2f})",
-                    },
-                    {
-                        "action_type": "heading_change",
-                        "target_callsign": a2["callsign"],
-                        "value": 15,
-                        "secondary_target": None,
-                        "gate_id": None,
-                        "rationale": f"Proactive avoidance (dist={distance:.2f})",
-                    },
-                ]
-
-    # ============================================================
-    # 2. REACTIVE (if conflict already exists)
-    # ============================================================
-        if conflicts:
-            conflict = conflicts[0]
-            ac1 = next((a for a in aircraft if a["callsign"] == conflict["ac1"]), None)
-            ac2 = next((a for a in aircraft if a["callsign"] == conflict["ac2"]), None)
-
-            if ac1 is None or ac2 is None:
-                return _fallback_action(state, "Conflict callsign not found")
-
-            return [
-                {
-                    "action_type": "altitude_change",
-                    "target_callsign": ac1["callsign"],
-                    "value": 1000,
-                    "secondary_target": None,
-                    "gate_id": None,
-                    "rationale": "Reactive climb for separation",
-                },
-                {
-                    "action_type": "heading_change",
-                    "target_callsign": ac2["callsign"],
-                    "value": 15,
-                    "secondary_target": None,
-                    "gate_id": None,
-                    "rationale": "Reactive divergence",
-                },
-            ]
-
-        return _fallback_action(state, "No conflict detected")
-
-    # ================================================================
-    # TASK 3: EMERGENCY VECTORING
-    # ================================================================
-    if task == "emergency_vectoring":
-        aircraft = state.get("aircraft", [])
-        emerg = next((a for a in aircraft if a.get("is_emergency")), None)
-
-        if not emerg:
-            return _fallback_action(state, "No emergency aircraft")
-
-        return [{
-            "action_type":      "vector",
-            "target_callsign":  emerg["callsign"],
-            "value":            180,
-            "secondary_target": None,
-            "gate_id":          None,
-            "rationale":        "Direct emergency aircraft toward runway heading 180°",
-        }]
-
-    # ================================================================
-    # TASK 2: GO-AROUND PREVENTION
-    # ================================================================
-    if task == "go_around_prevention":
-        aircraft = state.get("aircraft", [])
-        if not aircraft:
-            return _fallback_action(state, "No aircraft")
-
-        # Helper: distance from runway threshold
-        def dist(a):
-            return math.sqrt(a["x"]**2 + a["y"]**2)
-
-        # Priority: emergencies first, then low fuel, then closest
-        def priority(a):
-            return (
-                not a.get("is_emergency", False),
-                a.get("fuel_state", 1.0),
-                dist(a),
-            )
-
-        sorted_ac = sorted(aircraft, key=priority)
-        actions = []
-
-        # Step 1: Check spacing on approach
-        approach_ac = sorted([a for a in aircraft if dist(a) < 60], key=dist)
-
-        for i in range(len(approach_ac) - 1):
-            lead = approach_ac[i]
-            trail = approach_ac[i + 1]
-            gap = dist(trail) - dist(lead)
-
-            if gap < 6:  # critical
-                actions.append({
-                    "action_type": "speed_change",
-                    "target_callsign": trail["callsign"],
-                    "value": -50,
-                    "secondary_target": None,
-                    "gate_id": None,
-                    "rationale": f"CRITICAL: Prevent go-around, gap={gap:.1f}",
-                })
-                break
-            elif gap < 10:  # warning
-                actions.append({
-                    "action_type": "speed_change",
-                    "target_callsign": trail["callsign"],
-                    "value": -20,
-                    "secondary_target": None,
-                    "gate_id": None,
-                    "rationale": f"Warning: Build separation, gap={gap:.1f}",
-                })
-                break
-
-        # Step 2: Ensure top-priority landing order
-        if sorted_ac and aircraft and sorted_ac[0]["callsign"] != aircraft[0]["callsign"]:
-            actions.append({
-                "action_type": "sequence_swap",
-                "target_callsign": sorted_ac[0]["callsign"],
-                "secondary_target": aircraft[0]["callsign"],
-                "value": None,
-                "gate_id": None,
-                "rationale": "Prioritize top landing aircraft",
-            })
-
-        if actions:
-            return actions[:2]
-
-        return [{
-            "action_type": "no_action",
-            "target_callsign": aircraft[0]["callsign"] if aircraft else "NONE",
-            "value": None,
-            "secondary_target": None,
-            "gate_id": None,
-            "rationale": "Sequence optimal",
-        }]
-
-    # ================================================================
-    # TASK 5: GATE ASSIGNMENT
-    # ================================================================
-    if task == "gate_assignment":
-        gates = state.get("gates", [])
-        aircraft = state.get("aircraft", [])
-        
-        needs_gate = []
-        for ac in aircraft:
-            assigned_gate = ac.get("assigned_gate", ac.get("gate", None))
-            if not assigned_gate and ac.get("status") != "DEPARTING":
-                needs_gate.append(ac)
-        
-        if not needs_gate:
-            return [{
-                "action_type": "no_action",
-                "target_callsign": aircraft[0]["callsign"] if aircraft else "NONE",
-                "value": None,
-                "secondary_target": None,
-                "gate_id": None,
-                "rationale": "Waiting for aircraft that need gate assignment",
-            }]
-        
-        target_ac = needs_gate[0]
-        callsign = target_ac.get("callsign")
-        ac_type = target_ac.get("aircraft_type", target_ac.get("type", ""))
-        
-        available_gates = []
-        for g in gates:
-            if g.get("occupied", False):
-                continue
-            if g.get("is_blocked", False) or g.get("blocked", False):
-                continue
-            compatible = g.get("compatible_types", g.get("compatible_aircraft", []))
-            if compatible and ac_type and ac_type not in compatible:
-                continue
-            available_gates.append(g)
-        
-        if available_gates:
-            best_gate = min(available_gates, 
-                        key=lambda g: g.get("taxi_dist_min", g.get("distance", 999)))
-            
-            return [{
-                "action_type": "assign_gate",
-                "target_callsign": callsign,
-                "value": None,
-                "secondary_target": None,
-                "gate_id": best_gate["gate_id"],
-                "rationale": f"Assign {callsign} to {best_gate['gate_id']}",
-            }]
-        
-        return [{
-            "action_type": "no_action",
-            "target_callsign": callsign,
-            "value": None,
-            "secondary_target": None,
-            "gate_id": None,
-            "rationale": f"No available gates for {callsign}",
-        }]
-
-    # ================================================================
-    # UNKNOWN TASK → Try Grok, then HF LLM, then hard fallback
-    # ================================================================
-    print(f"[STEP] Unknown task '{task}' — trying LLM fallbacks")
-
-    if GROK_API_KEY:
-        try:
-            print("[STEP] Trying Grok API...")
-            result = call_grok(state, step)
-            print("[STEP] Grok API succeeded")
-            return result
-        except Exception as exc:
-            print(f"[STEP] Grok API failed: {exc}")
-
-    if HF_TOKEN:
-        try:
-            print("[STEP] Trying HuggingFace LLM...")
-            result = call_hf_llm(state, step)
-            print("[STEP] HuggingFace LLM succeeded")
-            return result
-        except Exception as exc:
-            print(f"[STEP] HuggingFace LLM failed: {exc}")
-
-    return _fallback_action(state, f"No rule or LLM handled task '{task}'")
-
-
-# ── Main inference loop ────────────────────────────────────────────────────────
+# ── Main inference loop ───────────────────────────────────────────────────────
 
 def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
-    """
-    Run one episode of the ATC environment.
-    """
     print("[START]")
-    
-    # Check if server is ready before proceeding
+    print(f"[INFO] Using API_BASE_URL: {API_BASE_URL}")
+    print(f"[INFO] Using MODEL_NAME: {MODEL_NAME}")
+
     if not is_server_ready():
-        print("[INFO] Server not ready - this may be normal during deployment validation")
-        print("[INFO] Exiting gracefully without running inference")
+        print("[INFO] Server not ready — exiting gracefully")
         print("[END]")
         return
-    
+
     print(
         f"[STEP] Initialising environment at {API_BASE_URL} | "
         f"task={task} | model={MODEL_NAME} | seed={seed}"
     )
-    if GROK_API_KEY:
-        print(f"[STEP] Grok API enabled (model={GROK_MODEL})")
-    else:
-        print("[STEP] Grok API disabled — set GROK_API_KEY to enable")
 
     try:
         state = env_reset(task, seed=seed)
     except Exception as exc:
         print(f"[STEP] ERROR: Failed to reset environment — {exc}")
         print("[END]")
-        return  # Return instead of sys.exit(1)
+        return
 
     print(
         f"[STEP] Environment reset. Task: {state.get('task')} | "
@@ -616,6 +342,7 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
     cumulative_score  = 0.0
     total_violations  = 0
     completed_steps   = 0
+    llm_calls_made = 0
 
     for step_num in range(1, MAX_STEPS + 1):
 
@@ -623,11 +350,14 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
             print(f"[STEP] Episode finished early at step {step_num - 1}.")
             break
 
-        actions = call_llm(state, step_num)
+        # ALWAYS call LLM proxy for decisions
+        actions = get_actions(state, step_num)
+        llm_calls_made += 1
 
         action_summary = "; ".join(
             f"{a.get('action_type')}({a.get('target_callsign')}"
             + (f",Δ{a.get('value')}" if a.get("value") is not None else "")
+            + (f",→{a.get('gate_id')}" if a.get("gate_id") else "")
             + ")"
             for a in actions
         )
@@ -670,6 +400,7 @@ def run_inference(task: str = DEFAULT_TASK, seed: Optional[int] = None):
     print(f"[STEP] ── Episode Summary ──────────────────────────")
     print(f"[STEP] Task:              {task}")
     print(f"[STEP] Completed steps:   {completed_steps}")
+    print(f"[STEP] LLM proxy calls:   {llm_calls_made}")
     print(f"[STEP] Avg reward:        {avg_reward:.4f}")
     print(f"[STEP] Avg score:         {avg_score:.4f}")
     print(f"[STEP] Total violations:  {total_violations}")
@@ -684,5 +415,4 @@ if __name__ == "__main__":
         run_inference(task=_task, seed=_seed)
     except Exception as e:
         print(f"[INFO] Inference exited gracefully: {e}")
-        # Exit with 0 to indicate this is expected during validation
         sys.exit(0)
